@@ -1,58 +1,132 @@
 {-# LANGUAGE DeriveGeneric             #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FunctionalDependencies    #-}
+{-# LANGUAGE MultiParamTypeClasses     #-}
+{-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE StandaloneDeriving        #-}
 module System.Hworker
        ( Result(..)
        , Job(..)
+       , Hworker
+       , create
        , queue
        , worker
        , monitor
        )
        where
 
-import           Control.Exception (SomeException, catch)
+import           Control.Exception    (SomeException, catch)
+import           Control.Monad        (forM, forever, void, when)
 import           Data.Binary
-import           Data.Monoid       ((<>))
-import           Data.Text         (Text)
-import qualified Data.Text         as T
-import           Data.Time.Clock   (UTCTime)
-import qualified Database.Redis    as R
-import           GHC.Generics      (Generic)
+import           Data.ByteString      (ByteString)
+import qualified Data.ByteString.Lazy as LB
+import           Data.Monoid          ((<>))
+import           Data.Text            (Text)
+import qualified Data.Text            as T
+import qualified Data.Text.Encoding   as T
+import           Data.Time.Calendar   (Day (..))
+import           Data.Time.Clock      (NominalDiffTime, UTCTime (..),
+                                       diffUTCTime, getCurrentTime)
+import qualified Database.Redis       as R
+import           GHC.Generics         (Generic)
 
 data Result = Success | Retry Text | Failure Text deriving (Generic, Show)
 instance Binary Result
 
-class (Binary t, Show t) => Job t where
-  job :: t -> IO Result
-  ran :: t -> (Result -> IO ())
-  ran _ = const (return ())
-
-data Complete t = Complete t Result
-
-instance Show t => Show (Complete t) where
-   show (Complete t r) = "Complete " <> show t <> " " <> show r
-
-instance Binary t => Binary (Complete t) where
-   put (Complete t r) = put (t,r)
-   get = uncurry Complete <$> get
-
-
-instance Job t => Job (Complete t) where
-  job (Complete t r) = catch (ran t r >> return Success)
-                             (\(e :: SomeException) ->
-                                return (Failure (T.pack $ "`ran` on Job " <>
-                                                          show t <>
-                                                          " raised exception: " <>
-                                                          show e)))
+class (Binary t, Show t) => Job s t | s -> t where
+  job :: s -> t -> IO Result
 
 data JobData t = JobData UTCTime t
 
-queue :: Job t => t -> IO ()
-queue job = undefined
+instance Binary UTCTime where
+  put t = put (toModifiedJulianDay . utctDay $ t, fromEnum (utctDayTime t))
+  get = do (d, t) <- get
+           return (UTCTime (ModifiedJulianDay d) (toEnum t))
 
-worker :: Text -> IO ()
-worker = undefined
+data Hworker s t = Hworker { hworkerName       :: ByteString
+                           , hworkerState      :: s
+                           , hworkerConnection :: R.Connection
+                           }
 
-monitor :: Text -> IO ()
-monitor = undefined
+create :: Job s t => Text -> s -> IO (Hworker s t)
+create name state = do conn <- R.connect R.defaultConnectInfo
+                       return $ Hworker (T.encodeUtf8 name) state conn
+
+jobQueue :: Hworker s t -> ByteString
+jobQueue hw = "hworker-jobs-" <> hworkerName hw
+
+progressQueue :: Hworker s t -> ByteString
+progressQueue hw = "hworker-progress-" <> hworkerName hw
+
+queue :: Job s t => Hworker s t -> t -> IO ()
+queue hw job = void $ R.runRedis (hworkerConnection hw) $
+                 R.lpush (jobQueue hw) [LB.toStrict $ encode job]
+
+worker :: Job s t => Hworker s t -> IO ()
+worker hw =
+  forever $
+    do now <- getCurrentTime
+       r <- R.runRedis (hworkerConnection hw) $
+              R.eval "local job = redis.call('rpop',KEYS[1])\n\
+                     \if job ~= nil then\n\
+                     \  redis.call('hset', KEYS[2], job, ARGV[1])\n\
+                     \  return job\n\
+                     \else\n\
+                     \  return nil\n\
+                     \end"
+                     [jobQueue hw, progressQueue hw]
+                     [LB.toStrict $ encode now]
+       case r of
+         Left err -> print err
+         Right Nothing -> return ()
+         Right (Just t) ->
+           do result <- job (hworkerState hw) (decode (LB.fromStrict t))
+              case result of
+                Success -> void $ R.runRedis (hworkerConnection hw)
+                                             (R.hdel (progressQueue hw) [t])
+                Retry msg -> do print ("Retry: " <> msg)
+                                return ()
+                Failure msg -> do print ("Fail: " <> msg)
+                                  void $ R.runRedis (hworkerConnection hw)
+                                                    (R.hdel (progressQueue hw) [t])
+
+timeout :: NominalDiffTime
+timeout = 60 * 60 * 4
+
+debugList hw a f =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> print err
+       Right [] -> return ()
+       Right xs -> f xs
+
+debugMaybe hw a f =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> print err
+       Right Nothing -> return ()
+       Right (Just v) -> f v
+
+debugNil hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> print err
+       Right (Just ("" :: ByteString)) -> return ()
+       Right _ -> return ()
+
+monitor :: Job s t => Hworker s t -> IO ()
+monitor hw =
+  forever $
+  do now <- getCurrentTime
+     debugList hw (R.hkeys (progressQueue hw))
+       (\jobs ->
+          void $ forM jobs $ \job ->
+            debugMaybe hw (R.hget (progressQueue hw) job)
+               (\start ->
+                  when (diffUTCTime now (decode (LB.fromStrict start)) > timeout) $
+                    do debugNil hw (R.eval "redis.call('rpush', KEYS[1], ARGV[1])\n\
+                                           \redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                           \return nil"
+                                           [jobQueue hw, progressQueue hw]
+                                           [start])))
