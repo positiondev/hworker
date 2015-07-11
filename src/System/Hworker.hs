@@ -70,8 +70,7 @@ queue hw j = void $ R.runRedis (hworkerConnection hw) $
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
   forever $
-  do threadDelay 1000000
-     forkIO $
+  do forkIO $
        do now <- getCurrentTime
           r <- R.runRedis (hworkerConnection hw) $
                  R.eval "local job = redis.call('rpop',KEYS[1])\n\
@@ -89,13 +88,18 @@ worker hw =
             Right (Just t) ->
               do result <- job (hworkerState hw) (fromJust $ decodeValue (LB.fromStrict t))
                  case result of
-                   Success -> void $ R.runRedis (hworkerConnection hw)
-                                                (R.hdel (progressQueue hw) [t])
+                   Success -> do delete_res <- R.runRedis (hworkerConnection hw)
+                                                          (R.hdel (progressQueue hw) [t])
+                                 case delete_res of
+                                   Left err -> print err
+                                   Right 1 -> return ()
+                                   Right n -> print ("Delete: did not delete 1, deleted " <> show n)
                    Retry msg -> do print ("Retry: " <> msg)
                                    return ()
                    Failure msg -> do print ("Fail: " <> msg)
                                      void $ R.runRedis (hworkerConnection hw)
                                                        (R.hdel (progressQueue hw) [t])
+     threadDelay 10000
 
 timeout :: NominalDiffTime
 timeout = 4

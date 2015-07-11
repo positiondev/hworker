@@ -20,7 +20,7 @@ library
   exposed-modules:     System.Hworker
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >=4.8 && < 5
+  build-depends:       base >= 4.8 && < 5
                      , aeson
                      , hedis >= 0.6.5
                      , text
@@ -29,6 +29,23 @@ library
                      , attoparsec
   hs-source-dirs:      src
   default-language:    Haskell2010
+
+Test-Suite test_hworker
+  type:            exitcode-stdio-1.0
+  hs-source-dirs:  spec
+  main-is:         Main.hs
+  build-depends:       base >= 4.8 && < 5
+                     , aeson
+                     , hedis >= 0.6.5
+                     , text
+                     , bytestring
+                     , time >= 1.5
+                     , attoparsec
+                     , hspec >= 2
+                     , hspec-contrib
+                     , HUnit
+                     , hworker == 0.1.0.0
+
 
 executable print_example
   hs-source-dirs: src example
