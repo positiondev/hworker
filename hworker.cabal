@@ -20,7 +20,7 @@ library
   exposed-modules:     System.Hworker
   -- other-modules:
   -- other-extensions:
-  build-depends:       base >= 4.8 && < 5
+  build-depends:       base >= 4.6 && < 5
                      , aeson
                      , hedis >= 0.6.5
                      , text
@@ -34,7 +34,7 @@ Test-Suite test_hworker
   type:            exitcode-stdio-1.0
   hs-source-dirs:  spec
   main-is:         Main.hs
-  build-depends:       base >= 4.8 && < 5
+  build-depends:       base >= 4.6 && < 5
                      , aeson
                      , hedis >= 0.6.5
                      , text
@@ -50,7 +50,7 @@ Test-Suite test_hworker
 executable print_example
   hs-source-dirs: src example
   main-is: Main.hs
-  build-depends:       base >=4.8 && < 5
+  build-depends:       base >= 4.6 && < 5
                      , aeson
                      , hedis >= 0.6.5
                      , text
