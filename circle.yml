@@ -8,6 +8,7 @@ dependencies:
   override:
     - stack setup
     - stack build
+    - stack test ; echo 0 # We want the test deps cached... :(
 
 test:
   override:
