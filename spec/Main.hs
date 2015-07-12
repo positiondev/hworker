@@ -75,7 +75,7 @@ main = hspec $
                hworker <- createWith "exworker-1" (ExState mvar) RetryOnException nullLogger
                wthread <- forkIO (worker hworker)
                queue hworker ExJob
-               threadDelay 30000
+               threadDelay 40000
                killThread wthread
                destroy hworker
                v <- takeMVar mvar
