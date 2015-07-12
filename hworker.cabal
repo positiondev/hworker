@@ -18,7 +18,7 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     System.Hworker
-  -- other-modules:
+  other-modules:       Data.Aeson.Helpers
   -- other-extensions:
   build-depends:       base >= 4.7 && < 5
                      , aeson
