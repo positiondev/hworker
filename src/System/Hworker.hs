@@ -3,6 +3,7 @@
 {-# LANGUAGE FunctionalDependencies    #-}
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE OverloadedStrings         #-}
+{-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE StandaloneDeriving        #-}
 module System.Hworker
@@ -11,6 +12,7 @@ module System.Hworker
        , Hworker
        , ExceptionBehavior(..)
        , create
+       , createWith
        , destroy
        , queue
        , worker
@@ -52,15 +54,24 @@ data JobData t = JobData UTCTime t
 
 data ExceptionBehavior = RetryOnException | FailOnException
 
+hwlog :: Show a => Hworker s t -> a -> IO ()
+hwlog hw a = hworkerLogger hw a
+
 data Hworker s t = Hworker { hworkerName              :: ByteString
                            , hworkerState             :: s
                            , hworkerConnection        :: R.Connection
                            , hworkerExceptionBehavior :: ExceptionBehavior
+                           , hworkerLogger            :: forall a. Show a => a -> IO ()
                            }
 
-create :: Job s t => Text -> s -> ExceptionBehavior -> IO (Hworker s t)
-create name state ex = do conn <- R.connect R.defaultConnectInfo
-                          return $ Hworker (T.encodeUtf8 name) state conn ex
+create :: Job s t => Text -> s -> IO (Hworker s t)
+create name state = createWith name state RetryOnException print
+
+createWith :: Job s t => Text -> s -> ExceptionBehavior -> (forall a. Show a => a -> IO ()) -> IO (Hworker s t)
+createWith name state ex logger =
+   do conn <- R.connect R.defaultConnectInfo
+      return $ Hworker (T.encodeUtf8 name) state conn ex logger
+
 
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw = void $ R.runRedis (hworkerConnection hw) $
@@ -90,7 +101,7 @@ worker hw =
                    [jobQueue hw, progressQueue hw]
                    [LB.toStrict $ A.encode now]
      case r of
-       Left err -> print err >> delayAndRun
+       Left err -> hwlog hw err >> delayAndRun
        Right Nothing -> delayAndRun
        Right (Just t) ->
          do result <- catchExceptions (job (hworkerState hw) (fromJust $ decodeValue (LB.fromStrict t)))
@@ -98,17 +109,17 @@ worker hw =
               Success -> do delete_res <- R.runRedis (hworkerConnection hw)
                                                      (R.hdel (progressQueue hw) [t])
                             case delete_res of
-                              Left err -> print err >> delayAndRun
+                              Left err -> hwlog hw err >> delayAndRun
                               Right 1 -> justRun
-                              Right n -> print ("Delete: did not delete 1, deleted " <> show n) >> delayAndRun
-              Retry msg -> do print ("Retry: " <> msg)
+                              Right n -> hwlog hw ("Delete: did not delete 1, deleted " <> show n) >> delayAndRun
+              Retry msg -> do hwlog hw ("Retry: " <> msg)
                               debugNil hw (R.eval "redis.call('lpush', KEYS[1], ARGV[2])\n\
                                                   \redis.call('hdel', KEYS[2], ARGV[1])\n\
                                                   \return nil"
                                                   [jobQueue hw, progressQueue hw]
                                                   [LB.toStrict $ A.encode now, t])
                               delayAndRun
-              Failure msg -> do print ("Fail: " <> msg)
+              Failure msg -> do hwlog hw ("Fail: " <> msg)
                                 void $ R.runRedis (hworkerConnection hw)
                                                   (R.hdel (progressQueue hw) [t])
                                 delayAndRun
@@ -127,21 +138,21 @@ timeout = 4
 debugList hw a f =
   do r <- R.runRedis (hworkerConnection hw) a
      case r of
-       Left err -> print err
+       Left err -> hwlog hw err
        Right [] -> return ()
        Right xs -> f xs
 
 debugMaybe hw a f =
   do r <- R.runRedis (hworkerConnection hw) a
      case r of
-       Left err -> print err
+       Left err -> hwlog hw err
        Right Nothing -> return ()
        Right (Just v) -> f v
 
 debugNil hw a =
   do r <- R.runRedis (hworkerConnection hw) a
      case r of
-       Left err -> print err
+       Left err -> hwlog hw err
        Right (Just ("" :: ByteString)) -> return ()
        Right _ -> return ()
 

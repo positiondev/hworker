@@ -33,12 +33,14 @@ instance Job ExState ExJob where
           then return Success
           else error "ExJob: failing badly!"
 
+nullLogger = const (return ())
+
 main :: IO ()
 main = hspec $
   do describe "Simple job" $
        do it "should run and increment counter" $
             do mvar <- newMVar 0
-               hworker <- create "aworker-1" (AState mvar) FailOnException
+               hworker <- createWith "aworker-1" (AState mvar) FailOnException nullLogger
                wthread <- forkIO (worker hworker)
                queue hworker AJob
                threadDelay 30000
@@ -48,7 +50,7 @@ main = hspec $
                assertEqual "State should be 1 after job runs" 1 v
           it "queueing 2 jobs should increment twice" $
             do mvar <- newMVar 0
-               hworker <- create "aworker-2" (AState mvar) FailOnException
+               hworker <- createWith "aworker-2" (AState mvar) FailOnException nullLogger
                wthread <- forkIO (worker hworker)
                queue hworker AJob
                queue hworker AJob
@@ -59,7 +61,7 @@ main = hspec $
                assertEqual "State should be 2 after 2 jobs run" 2 v
           it "queueing 1000 jobs should increment 1000" $
             do mvar <- newMVar 0
-               hworker <- create "aworker-3" (AState mvar) FailOnException
+               hworker <- createWith "aworker-3" (AState mvar) FailOnException nullLogger
                wthread <- forkIO (worker hworker)
                replicateM_ 1000 (queue hworker AJob)
                threadDelay 1000000
@@ -70,7 +72,7 @@ main = hspec $
      describe "Exceptions" $
        do it "should be able to have exceptions thrown in jobs and retry the job" $
             do mvar <- newMVar 0
-               hworker <- create "exworker-1" (ExState mvar) RetryOnException
+               hworker <- createWith "exworker-1" (ExState mvar) RetryOnException nullLogger
                wthread <- forkIO (worker hworker)
                queue hworker ExJob
                threadDelay 30000
@@ -80,7 +82,7 @@ main = hspec $
                assertEqual "State should be 2, since the first run failed" 2 v
           it "should not retry if mode is FailOnException" $
              do mvar <- newMVar 0
-                hworker <- create "exworker-2" (ExState mvar) FailOnException
+                hworker <- createWith "exworker-2" (ExState mvar) FailOnException nullLogger
                 wthread <- forkIO (worker hworker)
                 queue hworker ExJob
                 threadDelay 30000
