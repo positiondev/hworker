@@ -6,6 +6,10 @@ simple reliable mechanism for processing background tasks. The jobs
 can be created by a Haskell application or any application that can
 push JSON data structures of the right shape into a Redis queue.
 
+## Stability
+
+Not stable. This hasn't been used in production yet. Don't trust it!
+
 ## Overview
 
 To define jobs, you define whatever serialized representation of the
