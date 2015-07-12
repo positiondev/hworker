@@ -14,13 +14,13 @@ import           Test.Hspec
 import           Test.Hspec.Contrib.HUnit
 import           Test.HUnit
 
-data AJob = AJob deriving (Generic, Show)
-data AState = AState { unAState :: MVar Int }
-instance ToJSON AJob
-instance FromJSON AJob
-instance Job AState AJob where
-  job (AState mvar) AJob = do modifyMVar_ mvar (return . (+1))
-                              return Success
+data SimpleJob = SimpleJob deriving (Generic, Show)
+data SimpleState = SimpleState { unSimpleState :: MVar Int }
+instance ToJSON SimpleJob
+instance FromJSON SimpleJob
+instance Job SimpleState SimpleJob where
+  job (SimpleState mvar) SimpleJob = do modifyMVar_ mvar (return . (+1))
+                                        return Success
 
 data ExJob = ExJob deriving (Generic, Show)
 data ExState = ExState { unExState :: MVar Int }
@@ -53,12 +53,12 @@ print' a = do print a
 
 main :: IO ()
 main = hspec $
-  do describe "Simple job" $
+  do describe "Simple" $
        do it "should run and increment counter" $
             do mvar <- newMVar 0
-               hworker <- createWith "aworker-1" (AState mvar) FailOnException nullLogger 4 False
+               hworker <- createWith "simpleworker-1" (SimpleState mvar) FailOnException nullLogger 4 False
                wthread <- forkIO (worker hworker)
-               queue hworker AJob
+               queue hworker SimpleJob
                threadDelay 30000
                killThread wthread
                destroy hworker
@@ -66,10 +66,10 @@ main = hspec $
                assertEqual "State should be 1 after job runs" 1 v
           it "queueing 2 jobs should increment twice" $
             do mvar <- newMVar 0
-               hworker <- createWith "aworker-2" (AState mvar) FailOnException nullLogger 4 False
+               hworker <- createWith "simpleworker-2" (SimpleState mvar) FailOnException nullLogger 4 False
                wthread <- forkIO (worker hworker)
-               queue hworker AJob
-               queue hworker AJob
+               queue hworker SimpleJob
+               queue hworker SimpleJob
                threadDelay 40000
                killThread wthread
                destroy hworker
@@ -77,11 +77,29 @@ main = hspec $
                assertEqual "State should be 2 after 2 jobs run" 2 v
           it "queueing 1000 jobs should increment 1000" $
             do mvar <- newMVar 0
-               hworker <- createWith "aworker-3" (AState mvar) FailOnException nullLogger 4 False
+               hworker <- createWith "simpleworker-3" (SimpleState mvar) FailOnException nullLogger 4 False
                wthread <- forkIO (worker hworker)
-               replicateM_ 1000 (queue hworker AJob)
+               replicateM_ 1000 (queue hworker SimpleJob)
                threadDelay 1000000
                killThread wthread
+               destroy hworker
+               v <- takeMVar mvar
+               assertEqual "State should be 1000 after 1000 job runs" 1000 v
+          it "should work with multiple workers" $
+          -- NOTE(dbp 2015-07-12): This probably won't run faster, because
+          -- they are all blocking on the MVar, but that's not the point.
+            do mvar <- newMVar 0
+               hworker <- createWith "simpleworker-4" (SimpleState mvar) FailOnException nullLogger 4 False
+               wthread1 <- forkIO (worker hworker)
+               wthread2 <- forkIO (worker hworker)
+               wthread3 <- forkIO (worker hworker)
+               wthread4 <- forkIO (worker hworker)
+               replicateM_ 1000 (queue hworker SimpleJob)
+               threadDelay 1000000
+               killThread wthread1
+               killThread wthread2
+               killThread wthread3
+               killThread wthread4
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 1000 after 1000 job runs" 1000 v
