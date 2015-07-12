@@ -139,7 +139,7 @@ main = hspec $
           -- The timeout is 0.2 seconds. The job takes 0.1 seconds to run.
           -- The worker is killed after 0.01 seconds, which should be
           -- plenty of time for it to have started the job. Then after
-          -- the second worker is started, we wait 0.5 seconds, which
+          -- the second worker is started, we wait 0.7 seconds, which
           -- should be plenty; we expect the total run to take around 0.3.
             do mvar <- newMVar 0
                hworker <- createWith "timedworker-1" (TimedState mvar) FailOnException print' 0.2 False
@@ -149,7 +149,7 @@ main = hspec $
                threadDelay 10000
                killThread wthread1
                wthread2 <- forkIO (worker hworker)
-               threadDelay 500000
+               threadDelay 700000
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 2, since monitor thinks it failed" 2 v
