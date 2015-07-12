@@ -20,24 +20,25 @@ module System.Hworker
        )
        where
 
-import           Control.Concurrent   (forkIO, threadDelay)
-import           Control.Exception    (SomeException, catch)
-import           Control.Monad        (forM, forever, void, when)
-import           Data.Aeson           (FromJSON, ToJSON)
-import qualified Data.Aeson           as A
+import           Control.Concurrent      (forkIO, threadDelay)
+import           Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import           Control.Exception       (SomeException, catch)
+import           Control.Monad           (forM, forever, void, when)
+import           Data.Aeson              (FromJSON, ToJSON)
+import qualified Data.Aeson              as A
 import           Data.Aeson.Helpers
-import           Data.ByteString      (ByteString)
-import qualified Data.ByteString.Lazy as LB
-import           Data.Maybe           (fromJust)
-import           Data.Monoid          ((<>))
-import           Data.Text            (Text)
-import qualified Data.Text            as T
-import qualified Data.Text.Encoding   as T
-import           Data.Time.Calendar   (Day (..))
-import           Data.Time.Clock      (NominalDiffTime, UTCTime (..),
-                                       diffUTCTime, getCurrentTime)
-import qualified Database.Redis       as R
-import           GHC.Generics         (Generic)
+import           Data.ByteString         (ByteString)
+import qualified Data.ByteString.Lazy    as LB
+import           Data.Maybe              (fromJust)
+import           Data.Monoid             ((<>))
+import           Data.Text               (Text)
+import qualified Data.Text               as T
+import qualified Data.Text.Encoding      as T
+import           Data.Time.Calendar      (Day (..))
+import           Data.Time.Clock         (NominalDiffTime, UTCTime (..),
+                                          diffUTCTime, getCurrentTime)
+import qualified Database.Redis          as R
+import           GHC.Generics            (Generic)
 
 
 data Result = Success
@@ -57,20 +58,23 @@ data ExceptionBehavior = RetryOnException | FailOnException
 hwlog :: Show a => Hworker s t -> a -> IO ()
 hwlog hw a = hworkerLogger hw a
 
-data Hworker s t = Hworker { hworkerName              :: ByteString
-                           , hworkerState             :: s
-                           , hworkerConnection        :: R.Connection
-                           , hworkerExceptionBehavior :: ExceptionBehavior
-                           , hworkerLogger            :: forall a. Show a => a -> IO ()
-                           }
+data Hworker s t =
+     Hworker { hworkerName              :: ByteString
+             , hworkerState             :: s
+             , hworkerConnection        :: R.Connection
+             , hworkerExceptionBehavior :: ExceptionBehavior
+             , hworkerLogger            :: forall a. Show a => a -> IO ()
+             , hworkerJobTimeout        :: NominalDiffTime
+             , hworkerDebug             :: Bool
+             }
 
 create :: Job s t => Text -> s -> IO (Hworker s t)
-create name state = createWith name state RetryOnException print
+create name state = createWith name state RetryOnException print 4 False
 
-createWith :: Job s t => Text -> s -> ExceptionBehavior -> (forall a. Show a => a -> IO ()) -> IO (Hworker s t)
-createWith name state ex logger =
+createWith :: Job s t => Text -> s -> ExceptionBehavior -> (forall a. Show a => a -> IO ()) -> NominalDiffTime -> Bool -> IO (Hworker s t)
+createWith name state ex logger timeout debug =
    do conn <- R.connect R.defaultConnectInfo
-      return $ Hworker (T.encodeUtf8 name) state conn ex logger
+      return $ Hworker (T.encodeUtf8 name) state conn ex logger timeout debug
 
 
 destroy :: Job s t => Hworker s t -> IO ()
@@ -104,9 +108,11 @@ worker hw =
        Left err -> hwlog hw err >> delayAndRun
        Right Nothing -> delayAndRun
        Right (Just t) ->
-         do result <- catchExceptions (job (hworkerState hw) (fromJust $ decodeValue (LB.fromStrict t)))
+         do when (hworkerDebug hw) $ hwlog hw ("WORKER", r)
+            result <- runJob (job (hworkerState hw) (fromJust $ decodeValue (LB.fromStrict t)))
             case result of
-              Success -> do delete_res <- R.runRedis (hworkerConnection hw)
+              Success -> do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
+                            delete_res <- R.runRedis (hworkerConnection hw)
                                                      (R.hdel (progressQueue hw) [t])
                             case delete_res of
                               Left err -> hwlog hw err >> delayAndRun
@@ -125,15 +131,19 @@ worker hw =
                                 delayAndRun
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
-        catchExceptions v =
-          catch v (\(e::SomeException) ->
-                       let b = case hworkerExceptionBehavior hw of
-                                 RetryOnException -> Retry
-                                 FailOnException -> Failure in
-                       return (b ("Exception raised: " <> (T.pack . show) e)))
-
-timeout :: NominalDiffTime
-timeout = 4
+        runJob v =
+          do x <- newEmptyMVar
+             jt <- forkIO (catch (v >>= putMVar x . Right)
+                                 (\(e::SomeException) ->
+                                    putMVar x (Left e)))
+             res <- takeMVar x
+             case res of
+               Left e ->
+                 let b = case hworkerExceptionBehavior hw of
+                           RetryOnException -> Retry
+                           FailOnException -> Failure in
+                 return (b ("Exception raised: " <> (T.pack . show) e))
+               Right r -> return r
 
 debugList hw a f =
   do r <- R.runRedis (hworkerConnection hw) a
@@ -162,12 +172,16 @@ monitor hw =
   do now <- getCurrentTime
      debugList hw (R.hkeys (progressQueue hw))
        (\jobs ->
-          void $ forM jobs $ \job ->
-            debugMaybe hw (R.hget (progressQueue hw) job)
+          do when (hworkerDebug hw) $ hwlog hw ("MONITOR", jobs)
+             void $ forM jobs $ \job ->
+              debugMaybe hw (R.hget (progressQueue hw) job)
                (\start ->
-                  when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > timeout) $
-                   do debugNil hw (R.eval "redis.call('rpush', KEYS[1], ARGV[2])\n\
-                                          \redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                          \return nil"
-                                          [jobQueue hw, progressQueue hw]
-                                          [start, job])))
+                  do when (hworkerDebug hw) $ hwlog hw ("MONITOR", start, now, diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)), (hworkerJobTimeout hw))
+                     when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
+                       do when (hworkerDebug hw) $ hwlog hw ("MONITOR REQUEING", job)
+                          debugNil hw (R.eval "redis.call('rpush', KEYS[1], ARGV[2])\n\
+                                              \redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                              \return nil"
+                                              [jobQueue hw, progressQueue hw]
+                                              [start, job])))
+     threadDelay 10000
