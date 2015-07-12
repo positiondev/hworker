@@ -1,23 +1,20 @@
-## Design
+## About
 
-- Redis for reliable thread-safe queue.
-- Custom jobs queued and run.
-- Re-running on failure.
-- Can run standalone or fork in thread.
-
-## Libraries
-
-hedis
-aeson
+`hworker` is a Redis-backed persistent at-least-once queue library. It
+is vaguely inspired by `sidekiq` for Ruby. It is intended to be a
+simple reliable mechanism for processing background tasks. The jobs
+can be created by a Haskell application or any application that can
+push JSON data structures of the right shape into a Redis queue.
 
 ## Overview
 
 To define jobs, you define whatever serialized representation of the
-job, and a function that runs the job, which returns a status. The behavior
-of uncaught exceptions is defined when you create the worker - it can be either
-`Failure` or `Retry`. Jobs that return `Failure` are removed from the queue,
-whereas jobs that return `Retry` are added again. The only difference between
-a `Success` and a `Failure` is that a `Failure` returns a message that is logged.
+job, and a function that runs the job, which returns a status. The
+behavior of uncaught exceptions is defined when you create the
+worker - it can be either `Failure` or `Retry`. Jobs that return
+`Failure` are removed from the queue, whereas jobs that return `Retry`
+are added again. The only difference between a `Success` and a
+`Failure` is that a `Failure` returns a message that is logged.
 
 ## Semantics
 
@@ -102,6 +99,14 @@ Note that what the monitor does and `Retry` is slightly different -
 the monitor puts jobs on the front of the queue, whereas `Retry` puts
 them on the back.
 
+## Primary Libraries Used
+
+- hedis
+- aeson
+
+## Contributors
+
+- Daniel Patterson (@dbp - dbp@dbpmail.net)
 
 ## Build Status
 
