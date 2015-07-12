@@ -1,3 +1,12 @@
-machine:
-  ghc:
-    version: 7.10.1
+dependencies:
+  cache_directories:
+    - "~/.stack"
+  pre:
+    - cd /tmp && wget https://github.com/commercialhaskell/stack/releases/download/v0.1.2.0/stack-0.1.2.0-x86_64-linux.gz
+    - cd /tmp && gunzip stack-0.1.2.0-x86_64-linux.gz && mv stack-0.1.2.0-x86_64-linux /usr/bin/stack && chmod +x /usr/bin/stack
+  override:
+    - stack build
+
+test:
+  override:
+    - stack test

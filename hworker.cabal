@@ -32,7 +32,7 @@ library
 
 Test-Suite test_hworker
   type:            exitcode-stdio-1.0
-  hs-source-dirs:  spec
+  hs-source-dirs:  src spec
   main-is:         Main.hs
   build-depends:       base >= 4.7 && < 5
                      , aeson
@@ -44,7 +44,6 @@ Test-Suite test_hworker
                      , hspec >= 2
                      , hspec-contrib
                      , HUnit
-                     , hworker == 0.1.0.0
 
 
 executable print_example
