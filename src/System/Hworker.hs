@@ -112,7 +112,7 @@ worker hw =
        Left err -> hwlog hw err >> delayAndRun
        Right Nothing -> delayAndRun
        Right (Just t) ->
-         do when (hworkerDebug hw) $ hwlog hw ("WORKER", r)
+         do when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING", r)
             let (_ :: String, j) = fromJust $ decodeValue (LB.fromStrict t)
             result <- runJob (job (hworkerState hw) j)
             case result of
@@ -128,8 +128,10 @@ worker hw =
               Retry msg ->
                 do hwlog hw ("Retry: " <> msg)
                    debugNil hw
-                            (R.eval "redis.call('lpush', KEYS[1], ARGV[2])\n\
-                                    \redis.call('hdel', KEYS[2], ARGV[1])\n\
+                            (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                    \if del == 1 then\
+                                    \  redis.call('lpush', KEYS[1], ARGV[1])\n\
+                                    \end\
                                     \return nil"
                                     [jobQueue hw, progressQueue hw]
                                     [LB.toStrict $ A.encode now, t])
@@ -176,6 +178,13 @@ debugNil hw a =
        Right (Just ("" :: ByteString)) -> return ()
        Right _ -> return ()
 
+debugInt :: Hworker s t -> R.Redis (Either R.Reply Integer) -> IO Integer
+debugInt hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err >> return (-1)
+       Right n -> return n
+
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $
@@ -186,11 +195,15 @@ monitor hw =
               debugMaybe hw (R.hget (progressQueue hw) job)
                (\start ->
                   do when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
-                       do when (hworkerDebug hw) $ hwlog hw ("MONITOR REQUEING", job)
-                          debugNil hw
-                            (R.eval "redis.call('rpush', KEYS[1], ARGV[1])\n\
-                                    \redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                    \return nil"
-                                    [jobQueue hw, progressQueue hw]
-                                    [job])))
+                       do n <- debugInt hw
+                                 (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                         \if del == 1 then\
+                                         \  redis.call('rpush', KEYS[1], ARGV[1])\n\
+                                         \  return 1\n\
+                                         \else\n\
+                                         \  return 0\n\
+                                         \end"
+                                         [jobQueue hw, progressQueue hw]
+                                         [job])
+                          when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
      threadDelay 10000
