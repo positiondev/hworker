@@ -213,3 +213,26 @@ main = hspec $
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
+          it "should work with multiple monitors" $
+            do mvar <- newMVar 0
+               hworker <- createWith "timedworker-2"
+                                     (TimedState mvar)
+                                     FailOnException
+                                     print'
+                                     5
+                                     False
+               wthread1 <- forkIO (worker hworker)
+               wthread2 <- forkIO (worker hworker)
+               mthread1 <- forkIO (monitor hworker)
+               mthread2 <- forkIO (monitor hworker)
+               mthread3 <- forkIO (monitor hworker)
+               queue hworker (TimedJob 1000000)
+               queue hworker (TimedJob 1000000)
+               threadDelay 500000
+               killThread wthread1
+               killThread wthread2
+               wthread3 <- forkIO (worker hworker)
+               threadDelay 10000000
+               destroy hworker
+               v <- takeMVar mvar
+               assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
