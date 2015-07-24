@@ -37,6 +37,8 @@ import qualified Data.Text.Encoding      as T
 import           Data.Time.Calendar      (Day (..))
 import           Data.Time.Clock         (NominalDiffTime, UTCTime (..),
                                           diffUTCTime, getCurrentTime)
+import qualified Data.UUID               as UUID
+import qualified Data.UUID.V4            as UUID
 import qualified Database.Redis          as R
 import           GHC.Generics            (Generic)
 
@@ -88,8 +90,10 @@ progressQueue :: Hworker s t -> ByteString
 progressQueue hw = "hworker-progress-" <> hworkerName hw
 
 queue :: Job s t => Hworker s t -> t -> IO ()
-queue hw j = void $ R.runRedis (hworkerConnection hw) $
-               R.lpush (jobQueue hw) [LB.toStrict $ A.encode j]
+queue hw j =
+  do job_id <- UUID.toString <$> UUID.nextRandom
+     void $ R.runRedis (hworkerConnection hw) $
+            R.lpush (jobQueue hw) [LB.toStrict $ A.encode (job_id, j)]
 
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
@@ -109,26 +113,32 @@ worker hw =
        Right Nothing -> delayAndRun
        Right (Just t) ->
          do when (hworkerDebug hw) $ hwlog hw ("WORKER", r)
-            result <- runJob (job (hworkerState hw) (fromJust $ decodeValue (LB.fromStrict t)))
+            let (_ :: String, j) = fromJust $ decodeValue (LB.fromStrict t)
+            result <- runJob (job (hworkerState hw) j)
             case result of
-              Success -> do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
-                            delete_res <- R.runRedis (hworkerConnection hw)
-                                                     (R.hdel (progressQueue hw) [t])
-                            case delete_res of
-                              Left err -> hwlog hw err >> delayAndRun
-                              Right 1 -> justRun
-                              Right n -> hwlog hw ("Delete: did not delete 1, deleted " <> show n) >> delayAndRun
-              Retry msg -> do hwlog hw ("Retry: " <> msg)
-                              debugNil hw (R.eval "redis.call('lpush', KEYS[1], ARGV[2])\n\
-                                                  \redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                                  \return nil"
-                                                  [jobQueue hw, progressQueue hw]
-                                                  [LB.toStrict $ A.encode now, t])
-                              delayAndRun
-              Failure msg -> do hwlog hw ("Fail: " <> msg)
-                                void $ R.runRedis (hworkerConnection hw)
-                                                  (R.hdel (progressQueue hw) [t])
-                                delayAndRun
+              Success ->
+                do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
+                   delete_res <- R.runRedis (hworkerConnection hw)
+                                            (R.hdel (progressQueue hw) [t])
+                   case delete_res of
+                     Left err -> hwlog hw err >> delayAndRun
+                     Right 1 -> justRun
+                     Right n -> do hwlog hw ("Delete: did not delete 1, deleted " <> show n)
+                                   delayAndRun
+              Retry msg ->
+                do hwlog hw ("Retry: " <> msg)
+                   debugNil hw
+                            (R.eval "redis.call('lpush', KEYS[1], ARGV[2])\n\
+                                    \redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                    \return nil"
+                                    [jobQueue hw, progressQueue hw]
+                                    [LB.toStrict $ A.encode now, t])
+                   delayAndRun
+              Failure msg ->
+                do hwlog hw ("Fail: " <> msg)
+                   void $ R.runRedis (hworkerConnection hw)
+                                     (R.hdel (progressQueue hw) [t])
+                   delayAndRun
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
         runJob v =
@@ -172,16 +182,15 @@ monitor hw =
   do now <- getCurrentTime
      debugList hw (R.hkeys (progressQueue hw))
        (\jobs ->
-          do when (hworkerDebug hw) $ hwlog hw ("MONITOR", jobs)
-             void $ forM jobs $ \job ->
+          do void $ forM jobs $ \job ->
               debugMaybe hw (R.hget (progressQueue hw) job)
                (\start ->
-                  do when (hworkerDebug hw) $ hwlog hw ("MONITOR", start, now, diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)), (hworkerJobTimeout hw))
-                     when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
+                  do when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
                        do when (hworkerDebug hw) $ hwlog hw ("MONITOR REQUEING", job)
-                          debugNil hw (R.eval "redis.call('rpush', KEYS[1], ARGV[2])\n\
-                                              \redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                              \return nil"
-                                              [jobQueue hw, progressQueue hw]
-                                              [start, job])))
+                          debugNil hw
+                            (R.eval "redis.call('rpush', KEYS[1], ARGV[1])\n\
+                                    \redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                    \return nil"
+                                    [jobQueue hw, progressQueue hw]
+                                    [job])))
      threadDelay 10000
