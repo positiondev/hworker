@@ -55,4 +55,5 @@ executable print_example
                      , bytestring
                      , time >= 1.5
                      , attoparsec
+                     , uuid >= 1.2.6
   default-language:    Haskell2010
