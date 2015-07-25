@@ -30,8 +30,8 @@ library
 
 Test-Suite test_hworker
   type:            exitcode-stdio-1.0
-  hs-source-dirs:  src spec
-  main-is:         Main.hs
+  hs-source-dirs:  src test
+  main-is:         Spec.hs
   build-depends:       base >= 4.7 && < 5
                      , aeson
                      , hedis >= 0.6.5
