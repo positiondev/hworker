@@ -35,6 +35,30 @@ instance Job ExState ExJob where
           then return Success
           else error "ExJob: failing badly!"
 
+data RetryJob = RetryJob deriving (Generic, Show)
+data RetryState = RetryState { unRetryState :: MVar Int }
+instance ToJSON RetryJob
+instance FromJSON RetryJob
+instance Job RetryState RetryJob where
+  job (RetryState mvar) RetryJob =
+    do modifyMVarMasked_ mvar (return . (+1))
+       v <- readMVar mvar
+       if v > 1
+          then return Success
+          else return (Retry "RetryJob retries")
+
+data FailJob = FailJob deriving (Generic, Show)
+data FailState = FailState { unFailState :: MVar Int }
+instance ToJSON FailJob
+instance FromJSON FailJob
+instance Job FailState FailJob where
+  job (FailState mvar) FailJob =
+    do modifyMVarMasked_ mvar (return . (+1))
+       v <- readMVar mvar
+       if v > 1
+          then return Success
+          else return (Failure "FailJob fails")
+
 data TimedJob = TimedJob Int deriving (Generic, Show)
 data TimedState = TimedState { unTimedState :: MVar Int }
 instance ToJSON TimedJob
@@ -157,6 +181,38 @@ main = hspec $
                 v <- takeMVar mvar
                 assertEqual "State should be 1, since failing run wasn't retried" 1 v
 
+     describe "Retry" $
+       do it "should be able to return Retry and get run again" $
+            do mvar <- newMVar 0
+               hworker <- createWith "retryworker-1"
+                                     (RetryState mvar)
+                                     FailOnException
+                                     nullLogger
+                                     4
+                                     False
+               wthread <- forkIO (worker hworker)
+               queue hworker RetryJob
+               threadDelay 50000
+               destroy hworker
+               v <- takeMVar mvar
+               assertEqual "State should be 2, since it got retried" 2 v
+
+     describe "Fail" $
+       do it "should not retry a job that Fails" $
+            do mvar <- newMVar 0
+               hworker <- createWith "failworker-1"
+                                     (FailState mvar)
+                                     FailOnException
+                                     nullLogger
+                                     4
+                                     False
+               wthread <- forkIO (worker hworker)
+               queue hworker FailJob
+               threadDelay 30000
+               destroy hworker
+               v <- takeMVar mvar
+               assertEqual "State should be 1, since failing run wasn't retried" 1 v
+
      describe "Monitor" $
        do it "should add job back after timeout" $
           -- NOTE(dbp 2015-07-12): The timing on this test is somewhat
@@ -215,7 +271,7 @@ main = hspec $
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
           it "should work with multiple monitors" $
             do mvar <- newMVar 0
-               hworker <- createWith "timedworker-2"
+               hworker <- createWith "timedworker-3"
                                      (TimedState mvar)
                                      FailOnException
                                      nullLogger
