@@ -223,8 +223,8 @@ main = hspec $
                                      False
                wthread1 <- forkIO (worker hworker)
                wthread2 <- forkIO (worker hworker)
-               -- NOTE(dbp 2015-07-24): This might seem silly, but it was actually sufficient
-               -- to expose a race condition.
+               -- NOTE(dbp 2015-07-24): This might seem silly, but it
+               -- was actually sufficient to expose a race condition.
                mthread1 <- forkIO (monitor hworker)
                mthread2 <- forkIO (monitor hworker)
                mthread3 <- forkIO (monitor hworker)
@@ -237,12 +237,14 @@ main = hspec $
                killThread wthread1
                killThread wthread2
                wthread3 <- forkIO (worker hworker)
-               threadDelay 10000000
+               threadDelay 15000000
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
-          -- NOTE(dbp 2015-07-24): It would be really great to have a test that went
-          -- after a race between the retry logic and the monitors (ie, assume that the job
-          -- completed with Retry, and it happened to complete right at the timeout period).
-          -- I'm not sure if I could get that sort of precision without adding other delay
-          -- mechanisms, or something to make it more deterministic.
+          -- NOTE(dbp 2015-07-24): It would be really great to have a
+          -- test that went after a race between the retry logic and
+          -- the monitors (ie, assume that the job completed with
+          -- Retry, and it happened to complete right at the timeout
+          -- period).  I'm not sure if I could get that sort of
+          -- precision without adding other delay mechanisms, or
+          -- something to make it more deterministic.

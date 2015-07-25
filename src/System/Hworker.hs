@@ -17,6 +17,7 @@ module System.Hworker
        , queue
        , worker
        , monitor
+       , debugger
        )
        where
 
@@ -128,13 +129,13 @@ worker hw =
               Retry msg ->
                 do hwlog hw ("Retry: " <> msg)
                    debugNil hw
-                            (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                            (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                                     \if del == 1 then\
-                                    \  redis.call('lpush', KEYS[1], ARGV[1])\n\
-                                    \end\
+                                    \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                    \end\n\
                                     \return nil"
-                                    [jobQueue hw, progressQueue hw]
-                                    [LB.toStrict $ A.encode now, t])
+                                    [progressQueue hw, jobQueue hw]
+                                    [t])
                    delayAndRun
               Failure msg ->
                 do hwlog hw ("Fail: " <> msg)
@@ -185,6 +186,15 @@ debugInt hw a =
        Left err -> hwlog hw err >> return (-1)
        Right n -> return n
 
+debugger :: Job s t => Int -> Hworker s t -> IO ()
+debugger microseconds hw =
+  forever $
+  do debugList hw (R.hkeys (progressQueue hw))
+               (\running ->
+                  debugList hw (R.lrange (jobQueue hw) 0 (-1))
+                        (\queued -> hwlog hw ("DEBUG", queued, running)))
+     threadDelay microseconds
+
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $
@@ -198,12 +208,10 @@ monitor hw =
                        do n <- debugInt hw
                                  (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
                                          \if del == 1 then\
-                                         \  redis.call('rpush', KEYS[1], ARGV[1])\n\
-                                         \  return 1\n\
-                                         \else\n\
-                                         \  return 0\n\
-                                         \end"
+                                         \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
+                                         \return del"
                                          [jobQueue hw, progressQueue hw]
                                          [job])
+                          when (hworkerDebug hw) $ hwlog hw ("MONITOR RV", n)
                           when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
      threadDelay 10000
