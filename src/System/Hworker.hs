@@ -205,13 +205,15 @@ monitor hw =
               debugMaybe hw (R.hget (progressQueue hw) job)
                (\start ->
                   do when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
-                       do n <- debugInt hw
-                                 (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                         \if del == 1 then\
-                                         \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
-                                         \return del"
-                                         [jobQueue hw, progressQueue hw]
-                                         [job])
+                       do n <-
+                            debugInt hw
+                              (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                      \if del == 1 then\
+                                      \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
+                                      \return del"
+                                      [jobQueue hw, progressQueue hw]
+                                      [job])
                           when (hworkerDebug hw) $ hwlog hw ("MONITOR RV", n)
                           when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
-     threadDelay 10000
+     -- NOTE(dbp 2015-07-25): We check every 1/10th of timeout.
+     threadDelay (floor $ 100000 * (hworkerJobTimeout hw))

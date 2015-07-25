@@ -237,7 +237,7 @@ main = hspec $
                killThread wthread1
                killThread wthread2
                wthread3 <- forkIO (worker hworker)
-               threadDelay 15000000
+               threadDelay 20000000
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
