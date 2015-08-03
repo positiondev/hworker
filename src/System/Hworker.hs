@@ -72,7 +72,7 @@ data Hworker s t =
              }
 
 create :: Job s t => Text -> s -> IO (Hworker s t)
-create name state = createWith name state RetryOnException print 4 False
+create name state = createWith name state RetryOnException print 120 False
 
 createWith :: Job s t => Text -> s -> ExceptionBehavior -> (forall a. Show a => a -> IO ()) -> NominalDiffTime -> Bool -> IO (Hworker s t)
 createWith name state ex logger timeout debug =

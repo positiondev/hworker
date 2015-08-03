@@ -10,6 +10,19 @@ push JSON data structures of the right shape into a Redis queue.
 
 Not stable. This hasn't been used in production yet. Don't trust it!
 
+## Important
+
+The expiration of jobs is really important. It defaults to 120
+seconds, which may be short depending on your application (for things
+like sending emails, it may be fine). The reason why this timeout is
+important is that if a job ever runs longer than this, the monitor
+will think that the job failed in some inexplicable way (like the
+server running the job died) and will add the job back to the queue to
+be run. Based on the semantics of this job processor, jobs running
+multiple times is not a failure case, but it's obviously not something
+you _want_ to happen, so be sure to set the timeout to something
+reasonable for your application.
+
 ## Overview
 
 To define jobs, you define whatever serialized representation of the
