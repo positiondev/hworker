@@ -12,6 +12,7 @@ module System.Hworker
        , Job(..)
        , Hworker
        , ExceptionBehavior(..)
+       , RedisConnection(..)
        , HworkerConfig(..)
        , defaultHworkerConfig
        , create
@@ -74,11 +75,14 @@ data Hworker s t =
              , hworkerDebug             :: Bool
              }
 
+data RedisConnection = RedisConnectInfo R.ConnectInfo
+                     | RedisConnection R.Connection
+
 data HworkerConfig s =
      HworkerConfig {
          hwconfigName              :: Text
        , hwconfigState             :: s
-       , hwconfigRedisConnectInfo  :: R.ConnectInfo
+       , hwconfigRedisConnectInfo  :: RedisConnection
        , hwconfigExceptionBehavior :: ExceptionBehavior
        , hwconfigLogger            :: (forall a. Show a => a -> IO ())
        , hwconfigTimeout           :: NominalDiffTime
@@ -89,7 +93,7 @@ defaultHworkerConfig :: Text -> s -> HworkerConfig s
 defaultHworkerConfig name state =
   HworkerConfig name
                 state
-                R.defaultConnectInfo
+                (RedisConnectInfo R.defaultConnectInfo)
                 RetryOnException
                 print
                 120
@@ -100,7 +104,9 @@ create name state = createWith (defaultHworkerConfig name state)
 
 createWith :: Job s t => HworkerConfig s -> IO (Hworker s t)
 createWith HworkerConfig{..} =
-   do conn <- R.connect hwconfigRedisConnectInfo
+   do conn <- case hwconfigRedisConnectInfo of
+                RedisConnectInfo c -> R.connect c
+                RedisConnection c -> return c
       return $ Hworker (T.encodeUtf8 hwconfigName)
                        hwconfigState
                        conn
