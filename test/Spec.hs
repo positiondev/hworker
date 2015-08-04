@@ -76,17 +76,19 @@ print' :: Show a => a -> IO ()
 print' a = do print a
               hFlush stdout
 
+conf n s = (defaultHworkerConfig n s) {
+               hwconfigLogger = nullLogger
+             , hwconfigExceptionBehavior = FailOnException
+             , hwconfigTimeout = 4
+             }
+
 main :: IO ()
 main = hspec $
   do describe "Simple" $
        do it "should run and increment counter" $
             do mvar <- newMVar 0
-               hworker <- createWith "simpleworker-1"
-                                     (SimpleState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "simpleworker-1"
+                                           (SimpleState mvar))
                wthread <- forkIO (worker hworker)
                queue hworker SimpleJob
                threadDelay 30000
@@ -96,12 +98,8 @@ main = hspec $
                assertEqual "State should be 1 after job runs" 1 v
           it "queueing 2 jobs should increment twice" $
             do mvar <- newMVar 0
-               hworker <- createWith "simpleworker-2"
-                                     (SimpleState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "simpleworker-2"
+                                           (SimpleState mvar))
                wthread <- forkIO (worker hworker)
                queue hworker SimpleJob
                queue hworker SimpleJob
@@ -112,12 +110,8 @@ main = hspec $
                assertEqual "State should be 2 after 2 jobs run" 2 v
           it "queueing 1000 jobs should increment 1000" $
             do mvar <- newMVar 0
-               hworker <- createWith "simpleworker-3"
-                                     (SimpleState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "simpleworker-3"
+                                           (SimpleState mvar))
                wthread <- forkIO (worker hworker)
                replicateM_ 1000 (queue hworker SimpleJob)
                threadDelay 1000000
@@ -129,12 +123,8 @@ main = hspec $
           -- NOTE(dbp 2015-07-12): This probably won't run faster, because
           -- they are all blocking on the MVar, but that's not the point.
             do mvar <- newMVar 0
-               hworker <- createWith "simpleworker-4"
-                                     (SimpleState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "simpleworker-4"
+                                           (SimpleState mvar))
                wthread1 <- forkIO (worker hworker)
                wthread2 <- forkIO (worker hworker)
                wthread3 <- forkIO (worker hworker)
@@ -152,12 +142,11 @@ main = hspec $
      describe "Exceptions" $
        do it "should be able to have exceptions thrown in jobs and retry the job" $
             do mvar <- newMVar 0
-               hworker <- createWith "exworker-1"
-                                     (ExState mvar)
-                                     RetryOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "exworker-1"
+                                           (ExState mvar)) {
+                                       hwconfigExceptionBehavior =
+                                         RetryOnException
+                                     }
                wthread <- forkIO (worker hworker)
                queue hworker ExJob
                threadDelay 40000
@@ -167,12 +156,8 @@ main = hspec $
                assertEqual "State should be 2, since the first run failed" 2 v
           it "should not retry if mode is FailOnException" $
              do mvar <- newMVar 0
-                hworker <- createWith "exworker-2"
-                                      (ExState mvar)
-                                      FailOnException
-                                      nullLogger
-                                      4
-                                      False
+                hworker <- createWith (conf "exworker-2"
+                                            (ExState mvar))
                 wthread <- forkIO (worker hworker)
                 queue hworker ExJob
                 threadDelay 30000
@@ -184,12 +169,8 @@ main = hspec $
      describe "Retry" $
        do it "should be able to return Retry and get run again" $
             do mvar <- newMVar 0
-               hworker <- createWith "retryworker-1"
-                                     (RetryState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "retryworker-1"
+                                           (RetryState mvar))
                wthread <- forkIO (worker hworker)
                queue hworker RetryJob
                threadDelay 50000
@@ -200,12 +181,8 @@ main = hspec $
      describe "Fail" $
        do it "should not retry a job that Fails" $
             do mvar <- newMVar 0
-               hworker <- createWith "failworker-1"
-                                     (FailState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     4
-                                     False
+               hworker <- createWith (conf "failworker-1"
+                                           (FailState mvar))
                wthread <- forkIO (worker hworker)
                queue hworker FailJob
                threadDelay 30000
@@ -229,12 +206,10 @@ main = hspec $
           -- the second worker is started, we wait 10 seconds, which
           -- should be plenty; we expect the total run to take around 11.
             do mvar <- newMVar 0
-               hworker <- createWith "timedworker-1"
-                                     (TimedState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     5
-                                     False
+               hworker <- createWith (conf "timedworker-1"
+                                           (TimedState mvar)) {
+                                       hwconfigTimeout = 5
+                                     }
                wthread1 <- forkIO (worker hworker)
                mthread <- forkIO (monitor hworker)
                queue hworker (TimedJob 1000000)
@@ -250,12 +225,10 @@ main = hspec $
              -- have multiple jobs started, multiple workers killed.
              -- then one worker will finish both interrupted jobs.
             do mvar <- newMVar 0
-               hworker <- createWith "timedworker-2"
-                                     (TimedState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     5
-                                     False
+               hworker <- createWith (conf "timedworker-2"
+                                          (TimedState mvar)) {
+                                       hwconfigTimeout = 5
+                                     }
                wthread1 <- forkIO (worker hworker)
                wthread2 <- forkIO (worker hworker)
                mthread <- forkIO (monitor hworker)
@@ -271,12 +244,10 @@ main = hspec $
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
           it "should work with multiple monitors" $
             do mvar <- newMVar 0
-               hworker <- createWith "timedworker-3"
-                                     (TimedState mvar)
-                                     FailOnException
-                                     nullLogger
-                                     5
-                                     False
+               hworker <- createWith (conf "timedworker-3"
+                                          (TimedState mvar)) {
+                                       hwconfigTimeout = 5
+                                     }
                wthread1 <- forkIO (worker hworker)
                wthread2 <- forkIO (worker hworker)
                -- NOTE(dbp 2015-07-24): This might seem silly, but it

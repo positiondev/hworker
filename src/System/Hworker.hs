@@ -4,6 +4,7 @@
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE RankNTypes                #-}
+{-# LANGUAGE RecordWildCards           #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE StandaloneDeriving        #-}
 module System.Hworker
@@ -11,6 +12,8 @@ module System.Hworker
        , Job(..)
        , Hworker
        , ExceptionBehavior(..)
+       , HworkerConfig(..)
+       , defaultHworkerConfig
        , create
        , createWith
        , destroy
@@ -71,13 +74,40 @@ data Hworker s t =
              , hworkerDebug             :: Bool
              }
 
-create :: Job s t => Text -> s -> IO (Hworker s t)
-create name state = createWith name state RetryOnException print 120 False
+data HworkerConfig s =
+     HworkerConfig {
+         hwconfigName              :: Text
+       , hwconfigState             :: s
+       , hwconfigRedisConnectInfo  :: R.ConnectInfo
+       , hwconfigExceptionBehavior :: ExceptionBehavior
+       , hwconfigLogger            :: (forall a. Show a => a -> IO ())
+       , hwconfigTimeout           :: NominalDiffTime
+       , hwconfigDebug             :: Bool
+       }
 
-createWith :: Job s t => Text -> s -> ExceptionBehavior -> (forall a. Show a => a -> IO ()) -> NominalDiffTime -> Bool -> IO (Hworker s t)
-createWith name state ex logger timeout debug =
-   do conn <- R.connect R.defaultConnectInfo
-      return $ Hworker (T.encodeUtf8 name) state conn ex logger timeout debug
+defaultHworkerConfig :: Text -> s -> HworkerConfig s
+defaultHworkerConfig name state =
+  HworkerConfig name
+                state
+                R.defaultConnectInfo
+                RetryOnException
+                print
+                120
+                False
+
+create :: Job s t => Text -> s -> IO (Hworker s t)
+create name state = createWith (defaultHworkerConfig name state)
+
+createWith :: Job s t => HworkerConfig s -> IO (Hworker s t)
+createWith HworkerConfig{..} =
+   do conn <- R.connect hwconfigRedisConnectInfo
+      return $ Hworker (T.encodeUtf8 hwconfigName)
+                       hwconfigState
+                       conn
+                       hwconfigExceptionBehavior
+                       hwconfigLogger
+                       hwconfigTimeout
+                       hwconfigDebug
 
 
 destroy :: Job s t => Hworker s t -> IO ()
