@@ -21,10 +21,12 @@ module System.Hworker
        , queue
        , worker
        , monitor
+       , broken
        , debugger
        )
        where
 
+import           Control.Arrow           ((***))
 import           Control.Concurrent      (forkIO, threadDelay)
 import           Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import           Control.Exception       (SomeException, catch)
@@ -33,6 +35,7 @@ import           Data.Aeson              (FromJSON, ToJSON)
 import qualified Data.Aeson              as A
 import           Data.Aeson.Helpers
 import           Data.ByteString         (ByteString)
+import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
 import           Data.Maybe              (fromJust)
 import           Data.Monoid             ((<>))
@@ -63,7 +66,7 @@ data JobData t = JobData UTCTime t
 data ExceptionBehavior = RetryOnException | FailOnException
 
 hwlog :: Show a => Hworker s t -> a -> IO ()
-hwlog hw a = hworkerLogger hw a
+hwlog hw a = hworkerLogger hw (hworkerName hw, a)
 
 data Hworker s t =
      Hworker { hworkerName              :: ByteString
@@ -118,13 +121,16 @@ createWith HworkerConfig{..} =
 
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw = void $ R.runRedis (hworkerConnection hw) $
-               R.del [(jobQueue hw), (progressQueue hw)]
+               R.del [(jobQueue hw), (progressQueue hw), (brokenQueue hw)]
 
 jobQueue :: Hworker s t -> ByteString
 jobQueue hw = "hworker-jobs-" <> hworkerName hw
 
 progressQueue :: Hworker s t -> ByteString
 progressQueue hw = "hworker-progress-" <> hworkerName hw
+
+brokenQueue :: Hworker s t -> ByteString
+brokenQueue hw = "hworker-broken-" <> hworkerName hw
 
 queue :: Job s t => Hworker s t -> t -> IO ()
 queue hw j =
@@ -149,35 +155,46 @@ worker hw =
        Left err -> hwlog hw err >> delayAndRun
        Right Nothing -> delayAndRun
        Right (Just t) ->
-         do when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING", r)
-            let (_ :: String, j) = fromJust $ decodeValue (LB.fromStrict t)
-            result <- runJob (job (hworkerState hw) j)
-            case result of
-              Success ->
-                do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
-                   delete_res <- R.runRedis (hworkerConnection hw)
-                                            (R.hdel (progressQueue hw) [t])
-                   case delete_res of
-                     Left err -> hwlog hw err >> delayAndRun
-                     Right 1 -> justRun
-                     Right n -> do hwlog hw ("Delete: did not delete 1, deleted " <> show n)
-                                   delayAndRun
-              Retry msg ->
-                do hwlog hw ("Retry: " <> msg)
-                   debugNil hw
-                            (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
-                                    \if del == 1 then\
-                                    \  redis.call('lpush', KEYS[2], ARGV[1])\n\
-                                    \end\n\
-                                    \return nil"
-                                    [progressQueue hw, jobQueue hw]
-                                    [t])
-                   delayAndRun
-              Failure msg ->
-                do hwlog hw ("Fail: " <> msg)
-                   void $ R.runRedis (hworkerConnection hw)
-                                     (R.hdel (progressQueue hw) [t])
-                   delayAndRun
+         do when (hworkerDebug hw) $ hwlog hw ("WORKER RUNNING", t)
+            case decodeValue (LB.fromStrict t) of
+              Nothing -> do hwlog hw ("BROKEN JOB", t)
+                            now <- getCurrentTime
+                            debugNil hw (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                                \if del == 1 then\n\
+                                                \  redis.call('hset', KEYS[2], ARGV[1], ARGV[2])\n\
+                                                \end\n\
+                                                \return nil"
+                                                [progressQueue hw, brokenQueue hw]
+                                                [t, LB.toStrict $ A.encode now])
+                            delayAndRun
+              Just (_ :: String, j) -> do
+                result <- runJob (job (hworkerState hw) j)
+                case result of
+                  Success ->
+                    do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
+                       delete_res <- R.runRedis (hworkerConnection hw)
+                                                (R.hdel (progressQueue hw) [t])
+                       case delete_res of
+                         Left err -> hwlog hw err >> delayAndRun
+                         Right 1 -> justRun
+                         Right n -> do hwlog hw ("Job done: did not delete 1, deleted " <> show n)
+                                       delayAndRun
+                  Retry msg ->
+                    do hwlog hw ("Retry: " <> msg)
+                       debugNil hw
+                                (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                        \if del == 1 then\n\
+                                        \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                        \end\n\
+                                        \return nil"
+                                        [progressQueue hw, jobQueue hw]
+                                        [t])
+                       delayAndRun
+                  Failure msg ->
+                    do hwlog hw ("Failure: " <> msg)
+                       void $ R.runRedis (hworkerConnection hw)
+                                         (R.hdel (progressQueue hw) [t])
+                       delayAndRun
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
         runJob v =
@@ -222,6 +239,13 @@ debugInt hw a =
        Left err -> hwlog hw err >> return (-1)
        Right n -> return n
 
+debugIgnore :: Hworker s t -> R.Redis (Either R.Reply a) -> IO ()
+debugIgnore hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err
+       Right _ -> return ()
+
 debugger :: Job s t => Int -> Hworker s t -> IO ()
 debugger microseconds hw =
   forever $
@@ -253,3 +277,10 @@ monitor hw =
                           when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
      -- NOTE(dbp 2015-07-25): We check every 1/10th of timeout.
      threadDelay (floor $ 100000 * (hworkerJobTimeout hw))
+
+broken :: Hworker s t -> IO [(ByteString, UTCTime)]
+broken hw = do r <- R.runRedis (hworkerConnection hw) (R.hgetall (brokenQueue hw))
+               case r of
+                 Left err -> hwlog hw err >> return []
+                 Right xs -> return (map (id *** parseTime) xs)
+  where parseTime = fromJust . decodeValue . LB.fromStrict

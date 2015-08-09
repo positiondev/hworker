@@ -268,10 +268,35 @@ main = hspec $
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
-          -- NOTE(dbp 2015-07-24): It would be really great to have a
-          -- test that went after a race between the retry logic and
-          -- the monitors (ie, assume that the job completed with
-          -- Retry, and it happened to complete right at the timeout
-          -- period).  I'm not sure if I could get that sort of
-          -- precision without adding other delay mechanisms, or
-          -- something to make it more deterministic.
+               -- NOTE(dbp 2015-07-24): It would be really great to have a
+               -- test that went after a race between the retry logic and
+               -- the monitors (ie, assume that the job completed with
+               -- Retry, and it happened to complete right at the timeout
+               -- period).  I'm not sure if I could get that sort of
+               -- precision without adding other delay mechanisms, or
+               -- something to make it more deterministic.
+     describe "Broken jobs" $
+       it "should store broken jobs" $
+         do -- NOTE(dbp 2015-08-09): The more common way this could
+            -- happen is that you change your serialization format. But
+            -- we can abuse this by creating two different workers
+            -- pointing to the same queue, and submit jobs in one, try
+            -- to run them in another, where the types are different.
+            mvar <- newMVar 0
+            hworker1 <- createWith (conf "broken-1"
+                                           (TimedState mvar)) {
+                                        hwconfigTimeout = 5
+                                      }
+            hworker2 <- createWith (conf "broken-1"
+                                           (SimpleState mvar)) {
+                                        hwconfigTimeout = 5
+                                      }
+            wthread <- forkIO (worker hworker1)
+            queue hworker2 SimpleJob
+            threadDelay 100000
+            jobs <- broken hworker2
+            killThread wthread
+            destroy hworker1
+            v <- takeMVar mvar
+            assertEqual "State should be 0, as nothing should have happened" 0 v
+            assertEqual "Should be one broken job, as serialization is wrong" 1 (length jobs)
