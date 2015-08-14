@@ -32,6 +32,8 @@ Test-Suite hworker-test
   type:            exitcode-stdio-1.0
   hs-source-dirs:  src test
   main-is:         Spec.hs
+  other-modules: Data.Aeson.Helpers
+               , System.Hworker
   build-depends:       base >= 4.7 && < 5
                      , aeson
                      , hedis >= 0.6.5
@@ -48,6 +50,8 @@ Test-Suite hworker-test
 executable print_example
   hs-source-dirs: src example
   main-is: Main.hs
+  other-modules: Data.Aeson.Helpers
+               , System.Hworker
   build-depends:       base >= 4.7 && < 5
                      , aeson
                      , hedis >= 0.6.5

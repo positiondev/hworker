@@ -22,6 +22,7 @@ module System.Hworker
        , worker
        , monitor
        , broken
+       , jobs
        , debugger
        )
        where
@@ -37,7 +38,7 @@ import           Data.Aeson.Helpers
 import           Data.ByteString         (ByteString)
 import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
-import           Data.Maybe              (fromJust)
+import           Data.Maybe              (catMaybes, fromJust)
 import           Data.Monoid             ((<>))
 import           Data.Text               (Text)
 import qualified Data.Text               as T
@@ -254,6 +255,14 @@ debugger microseconds hw =
                   debugList hw (R.lrange (jobQueue hw) 0 (-1))
                         (\queued -> hwlog hw ("DEBUG", queued, running)))
      threadDelay microseconds
+
+jobs :: Job s t => Hworker s t -> IO [t]
+jobs hw =
+  do r <- R.runRedis (hworkerConnection hw) (R.lrange (jobQueue hw) 0 (-1))
+     case r of
+       Left err -> hwlog hw err >> return []
+       Right [] -> return []
+       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
 
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =

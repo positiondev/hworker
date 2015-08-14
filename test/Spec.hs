@@ -14,7 +14,7 @@ import           Test.Hspec
 import           Test.Hspec.Contrib.HUnit
 import           Test.HUnit
 
-data SimpleJob = SimpleJob deriving (Generic, Show)
+data SimpleJob = SimpleJob deriving (Generic, Show, Eq)
 data SimpleState = SimpleState { unSimpleState :: MVar Int }
 instance ToJSON SimpleJob
 instance FromJSON SimpleJob
@@ -59,7 +59,7 @@ instance Job FailState FailJob where
           then return Success
           else return (Failure "FailJob fails")
 
-data TimedJob = TimedJob Int deriving (Generic, Show)
+data TimedJob = TimedJob Int deriving (Generic, Show, Eq)
 data TimedState = TimedState { unTimedState :: MVar Int }
 instance ToJSON TimedJob
 instance FromJSON TimedJob
@@ -300,3 +300,25 @@ main = hspec $
             v <- takeMVar mvar
             assertEqual "State should be 0, as nothing should have happened" 0 v
             assertEqual "Should be one broken job, as serialization is wrong" 1 (length jobs)
+     describe "dump jobs" $ do
+       it "should return the job that was queued" $
+         do mvar <- newMVar 0
+            hworker <- createWith (conf "dump-1"
+                                              (SimpleState mvar)) {
+                                       hwconfigTimeout = 5
+                                     }
+            queue hworker SimpleJob
+            res <- jobs hworker
+            destroy hworker
+            assertEqual "Should be [SimpleJob]" [SimpleJob] res
+       it "should return jobs in order (most recently added at front; worker pulls from back)" $
+         do mvar <- newMVar 0
+            hworker <- createWith (conf "dump-2"
+                                       (TimedState mvar)) {
+                                    hwconfigTimeout = 5
+                                  }
+            queue hworker (TimedJob 1)
+            queue hworker (TimedJob 2)
+            res <- jobs hworker
+            destroy hworker
+            assertEqual "Should by [TimedJob 2, TimedJob 1]" [TimedJob 2, TimedJob 1] res
