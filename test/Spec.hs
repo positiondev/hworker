@@ -6,6 +6,7 @@ import           Control.Concurrent.MVar  (MVar, modifyMVarMasked_, newMVar,
                                            readMVar, takeMVar)
 import           Control.Monad            (replicateM_)
 import           Data.Aeson               (FromJSON, ToJSON)
+import qualified Data.Text                as T
 import           GHC.Generics             (Generic)
 import           System.Hworker
 import           System.IO
@@ -47,7 +48,7 @@ instance Job RetryState RetryJob where
           then return Success
           else return (Retry "RetryJob retries")
 
-data FailJob = FailJob deriving (Generic, Show)
+data FailJob = FailJob deriving (Eq, Generic, Show)
 data FailState = FailState { unFailState :: MVar Int }
 instance ToJSON FailJob
 instance FromJSON FailJob
@@ -59,6 +60,15 @@ instance Job FailState FailJob where
           then return Success
           else return (Failure "FailJob fails")
 
+data AlwaysFailJob = AlwaysFailJob deriving (Eq, Generic, Show)
+data AlwaysFailState = AlwaysFailState { unAlwaysFailState :: MVar Int }
+instance ToJSON AlwaysFailJob
+instance FromJSON AlwaysFailJob
+instance Job AlwaysFailState AlwaysFailJob where
+  job (AlwaysFailState mvar) AlwaysFailJob =
+    do modifyMVarMasked_ mvar (return . (+1))
+       return (Failure "AlwaysFailJob fails")
+
 data TimedJob = TimedJob Int deriving (Generic, Show, Eq)
 data TimedState = TimedState { unTimedState :: MVar Int }
 instance ToJSON TimedJob
@@ -67,6 +77,15 @@ instance Job TimedState TimedJob where
   job (TimedState mvar) (TimedJob delay) =
     do threadDelay delay
        modifyMVarMasked_ mvar (return . (+1))
+       return Success
+
+data BigJob = BigJob T.Text deriving (Generic, Show, Eq)
+data BigState = BigState { unBigState :: MVar Int }
+instance ToJSON BigJob
+instance FromJSON BigJob
+instance Job BigState BigJob where
+  job (BigState mvar) (BigJob _) =
+    do modifyMVarMasked_ mvar (return . (+1))
        return Success
 
 nullLogger :: Show a => a -> IO ()
@@ -189,7 +208,34 @@ main = hspec $
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 1, since failing run wasn't retried" 1 v
-
+          it "should put a failed job into the failed queue" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "failworker-2"
+                                           (FailState mvar))
+               wthread <- forkIO (worker hworker)
+               queue hworker FailJob
+               threadDelay 30000
+               jobs <- failed hworker
+               destroy hworker
+               assertEqual "Should have failed job" [FailJob] jobs
+          it "should only store failedQueueSize failed jobs" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "failworker-3"
+                                           (AlwaysFailState mvar)) {
+                                     hwconfigFailedQueueSize = 2
+                           }
+               wthread <- forkIO (worker hworker)
+               queue hworker AlwaysFailJob
+               queue hworker AlwaysFailJob
+               queue hworker AlwaysFailJob
+               queue hworker AlwaysFailJob
+               threadDelay 100000
+               jobs <- failed hworker
+               destroy hworker
+               v <- takeMVar mvar
+               assertEqual "State should be 4, since all jobs were run" 4 v
+               assertEqual "Should only have stored 2"
+                           [AlwaysFailJob,AlwaysFailJob] jobs
      describe "Monitor" $
        do it "should add job back after timeout" $
           -- NOTE(dbp 2015-07-12): The timing on this test is somewhat
@@ -300,7 +346,7 @@ main = hspec $
             v <- takeMVar mvar
             assertEqual "State should be 0, as nothing should have happened" 0 v
             assertEqual "Should be one broken job, as serialization is wrong" 1 (length jobs)
-     describe "dump jobs" $ do
+     describe "Dump jobs" $ do
        it "should return the job that was queued" $
          do mvar <- newMVar 0
             hworker <- createWith (conf "dump-1"
@@ -322,3 +368,22 @@ main = hspec $
             res <- jobs hworker
             destroy hworker
             assertEqual "Should by [TimedJob 2, TimedJob 1]" [TimedJob 2, TimedJob 1] res
+     describe "Large jobs" $ do
+       it "should be able to deal with lots of large jobs" $
+         do mvar <- newMVar 0
+            hworker <- createWith (conf "big-1"
+                                       (BigState mvar))
+            wthread1 <- forkIO (worker hworker)
+            wthread2 <- forkIO (worker hworker)
+            wthread3 <- forkIO (worker hworker)
+            wthread4 <- forkIO (worker hworker)
+            let content = T.intercalate "\n" (take 1000 (repeat "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
+            replicateM_ 10000 (queue hworker (BigJob content))
+            threadDelay 10000000
+            killThread wthread1
+            killThread wthread2
+            killThread wthread3
+            killThread wthread4
+            destroy hworker
+            v <- takeMVar mvar
+            assertEqual "Should have processed 10000" 10000 v

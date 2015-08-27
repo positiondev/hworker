@@ -22,6 +22,7 @@ module System.Hworker
        , worker
        , monitor
        , broken
+       , failed
        , jobs
        , debugger
        )
@@ -76,6 +77,7 @@ data Hworker s t =
              , hworkerExceptionBehavior :: ExceptionBehavior
              , hworkerLogger            :: forall a. Show a => a -> IO ()
              , hworkerJobTimeout        :: NominalDiffTime
+             , hworkerFailedQueueSize   :: Int
              , hworkerDebug             :: Bool
              }
 
@@ -90,6 +92,7 @@ data HworkerConfig s =
        , hwconfigExceptionBehavior :: ExceptionBehavior
        , hwconfigLogger            :: (forall a. Show a => a -> IO ())
        , hwconfigTimeout           :: NominalDiffTime
+       , hwconfigFailedQueueSize   :: Int
        , hwconfigDebug             :: Bool
        }
 
@@ -98,9 +101,10 @@ defaultHworkerConfig name state =
   HworkerConfig name
                 state
                 (RedisConnectInfo R.defaultConnectInfo)
-                RetryOnException
+                FailOnException
                 print
                 120
+                1000
                 False
 
 create :: Job s t => Text -> s -> IO (Hworker s t)
@@ -117,12 +121,13 @@ createWith HworkerConfig{..} =
                        hwconfigExceptionBehavior
                        hwconfigLogger
                        hwconfigTimeout
+                       hwconfigFailedQueueSize
                        hwconfigDebug
 
 
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw = void $ R.runRedis (hworkerConnection hw) $
-               R.del [(jobQueue hw), (progressQueue hw), (brokenQueue hw)]
+               R.del [(jobQueue hw), (progressQueue hw), (brokenQueue hw), (failedQueue hw)]
 
 jobQueue :: Hworker s t -> ByteString
 jobQueue hw = "hworker-jobs-" <> hworkerName hw
@@ -132,6 +137,9 @@ progressQueue hw = "hworker-progress-" <> hworkerName hw
 
 brokenQueue :: Hworker s t -> ByteString
 brokenQueue hw = "hworker-broken-" <> hworkerName hw
+
+failedQueue :: Hworker s t -> ByteString
+failedQueue hw = "hworker-failed-" <> hworkerName hw
 
 queue :: Job s t => Hworker s t -> t -> IO ()
 queue hw j =
@@ -193,6 +201,15 @@ worker hw =
                        delayAndRun
                   Failure msg ->
                     do hwlog hw ("Failure: " <> msg)
+                       debugNil hw
+                                (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                        \if del == 1 then\n\
+                                        \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                        \  redis.call('ltrim', KEYS[2], 0, ARGV[2])\n\
+                                        \end\n\
+                                        \return nil"
+                                        [progressQueue hw, failedQueue hw]
+                                        [t, B8.pack (show (hworkerFailedQueueSize hw - 1))])
                        void $ R.runRedis (hworkerConnection hw)
                                          (R.hdel (progressQueue hw) [t])
                        delayAndRun
@@ -259,6 +276,14 @@ debugger microseconds hw =
 jobs :: Job s t => Hworker s t -> IO [t]
 jobs hw =
   do r <- R.runRedis (hworkerConnection hw) (R.lrange (jobQueue hw) 0 (-1))
+     case r of
+       Left err -> hwlog hw err >> return []
+       Right [] -> return []
+       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
+
+failed :: Job s t => Hworker s t -> IO [t]
+failed hw =
+  do r <- R.runRedis (hworkerConnection hw) (R.lrange (failedQueue hw) 0 (-1))
      case r of
        Left err -> hwlog hw err >> return []
        Right [] -> return []
