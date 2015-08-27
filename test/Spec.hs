@@ -378,7 +378,7 @@ main = hspec $
             wthread3 <- forkIO (worker hworker)
             wthread4 <- forkIO (worker hworker)
             let content = T.intercalate "\n" (take 1000 (repeat "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
-            replicateM_ 10000 (queue hworker (BigJob content))
+            replicateM_ 5000 (queue hworker (BigJob content))
             threadDelay 10000000
             killThread wthread1
             killThread wthread2
@@ -386,4 +386,4 @@ main = hspec $
             killThread wthread4
             destroy hworker
             v <- takeMVar mvar
-            assertEqual "Should have processed 10000" 10000 v
+            assertEqual "Should have processed 5000" 5000 v

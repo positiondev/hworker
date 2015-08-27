@@ -21,9 +21,9 @@ module System.Hworker
        , queue
        , worker
        , monitor
-       , broken
-       , failed
        , jobs
+       , failed
+       , broken
        , debugger
        )
        where
@@ -168,7 +168,7 @@ worker hw =
             case decodeValue (LB.fromStrict t) of
               Nothing -> do hwlog hw ("BROKEN JOB", t)
                             now <- getCurrentTime
-                            debugNil hw (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                            withNil hw (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                                                 \if del == 1 then\n\
                                                 \  redis.call('hset', KEYS[2], ARGV[1], ARGV[2])\n\
                                                 \end\n\
@@ -190,7 +190,7 @@ worker hw =
                                        delayAndRun
                   Retry msg ->
                     do hwlog hw ("Retry: " <> msg)
-                       debugNil hw
+                       withNil hw
                                 (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                                         \if del == 1 then\n\
                                         \  redis.call('lpush', KEYS[2], ARGV[1])\n\
@@ -201,7 +201,7 @@ worker hw =
                        delayAndRun
                   Failure msg ->
                     do hwlog hw ("Failure: " <> msg)
-                       debugNil hw
+                       withNil hw
                                 (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                                         \if del == 1 then\n\
                                         \  redis.call('lpush', KEYS[2], ARGV[1])\n\
@@ -229,78 +229,18 @@ worker hw =
                  return (b ("Exception raised: " <> (T.pack . show) e))
                Right r -> return r
 
-debugList hw a f =
-  do r <- R.runRedis (hworkerConnection hw) a
-     case r of
-       Left err -> hwlog hw err
-       Right [] -> return ()
-       Right xs -> f xs
-
-debugMaybe hw a f =
-  do r <- R.runRedis (hworkerConnection hw) a
-     case r of
-       Left err -> hwlog hw err
-       Right Nothing -> return ()
-       Right (Just v) -> f v
-
-debugNil hw a =
-  do r <- R.runRedis (hworkerConnection hw) a
-     case r of
-       Left err -> hwlog hw err
-       Right (Just ("" :: ByteString)) -> return ()
-       Right _ -> return ()
-
-debugInt :: Hworker s t -> R.Redis (Either R.Reply Integer) -> IO Integer
-debugInt hw a =
-  do r <- R.runRedis (hworkerConnection hw) a
-     case r of
-       Left err -> hwlog hw err >> return (-1)
-       Right n -> return n
-
-debugIgnore :: Hworker s t -> R.Redis (Either R.Reply a) -> IO ()
-debugIgnore hw a =
-  do r <- R.runRedis (hworkerConnection hw) a
-     case r of
-       Left err -> hwlog hw err
-       Right _ -> return ()
-
-debugger :: Job s t => Int -> Hworker s t -> IO ()
-debugger microseconds hw =
-  forever $
-  do debugList hw (R.hkeys (progressQueue hw))
-               (\running ->
-                  debugList hw (R.lrange (jobQueue hw) 0 (-1))
-                        (\queued -> hwlog hw ("DEBUG", queued, running)))
-     threadDelay microseconds
-
-jobs :: Job s t => Hworker s t -> IO [t]
-jobs hw =
-  do r <- R.runRedis (hworkerConnection hw) (R.lrange (jobQueue hw) 0 (-1))
-     case r of
-       Left err -> hwlog hw err >> return []
-       Right [] -> return []
-       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
-
-failed :: Job s t => Hworker s t -> IO [t]
-failed hw =
-  do r <- R.runRedis (hworkerConnection hw) (R.lrange (failedQueue hw) 0 (-1))
-     case r of
-       Left err -> hwlog hw err >> return []
-       Right [] -> return []
-       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
-
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $
   do now <- getCurrentTime
-     debugList hw (R.hkeys (progressQueue hw))
+     withList hw (R.hkeys (progressQueue hw))
        (\jobs ->
           do void $ forM jobs $ \job ->
-              debugMaybe hw (R.hget (progressQueue hw) job)
+              withMaybe hw (R.hget (progressQueue hw) job)
                (\start ->
                   do when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
                        do n <-
-                            debugInt hw
+                            withInt hw
                               (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
                                       \if del == 1 then\
                                       \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
@@ -318,3 +258,62 @@ broken hw = do r <- R.runRedis (hworkerConnection hw) (R.hgetall (brokenQueue hw
                  Left err -> hwlog hw err >> return []
                  Right xs -> return (map (id *** parseTime) xs)
   where parseTime = fromJust . decodeValue . LB.fromStrict
+
+jobsFromQueue :: Job s t => Hworker s t -> ByteString -> IO [t]
+jobsFromQueue hw queue =
+  do r <- R.runRedis (hworkerConnection hw) (R.lrange queue 0 (-1))
+     case r of
+       Left err -> hwlog hw err >> return []
+       Right [] -> return []
+       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
+
+jobs :: Job s t => Hworker s t -> IO [t]
+jobs hw = jobsFromQueue hw (jobQueue hw)
+
+failed :: Job s t => Hworker s t -> IO [t]
+failed hw = jobsFromQueue hw (failedQueue hw)
+
+debugger :: Job s t => Int -> Hworker s t -> IO ()
+debugger microseconds hw =
+  forever $
+  do withList hw (R.hkeys (progressQueue hw))
+               (\running ->
+                  withList hw (R.lrange (jobQueue hw) 0 (-1))
+                        (\queued -> hwlog hw ("DEBUG", queued, running)))
+     threadDelay microseconds
+
+-- Redis helpers follow
+withList hw a f =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err
+       Right [] -> return ()
+       Right xs -> f xs
+
+withMaybe hw a f =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err
+       Right Nothing -> return ()
+       Right (Just v) -> f v
+
+withNil hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err
+       Right (Just ("" :: ByteString)) -> return ()
+       Right _ -> return ()
+
+withInt :: Hworker s t -> R.Redis (Either R.Reply Integer) -> IO Integer
+withInt hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err >> return (-1)
+       Right n -> return n
+
+withIgnore :: Hworker s t -> R.Redis (Either R.Reply a) -> IO ()
+withIgnore hw a =
+  do r <- R.runRedis (hworkerConnection hw) a
+     case r of
+       Left err -> hwlog hw err
+       Right _ -> return ()
