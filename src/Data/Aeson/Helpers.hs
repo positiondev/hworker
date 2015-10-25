@@ -1,6 +1,5 @@
 module Data.Aeson.Helpers where
 
-
 import           Data.Aeson
 import           Data.Aeson.Parser    (value)
 import           Data.Attoparsec.Lazy (Parser)
@@ -16,7 +15,6 @@ decodeWith p to s =
                       _         -> Nothing
       _          -> Nothing
 {-# INLINE decodeWith #-}
-
 
 decodeValue :: FromJSON t => L.ByteString -> Maybe t
 decodeValue = decodeWith value fromJSON

@@ -7,28 +7,45 @@
 {-# LANGUAGE RecordWildCards           #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 {-# LANGUAGE StandaloneDeriving        #-}
+
+{-|
+
+This module contains an at-least-once persistent job processing queue
+backed by Redis. It depends upon Redis not losing data once it has
+acknowledged it, and guaranteeing the atomicity that is specified for
+commands like EVAL (ie, that if you do several things within an EVAL,
+they will all happen or none will happen). Nothing has been tested
+with Redis clusters (and it likely will not work).
+
+-}
+
 module System.Hworker
-       ( Result(..)
+       ( -- * Types
+         Result(..)
        , Job(..)
        , Hworker
+       , HworkerConfig(..)
        , ExceptionBehavior(..)
        , RedisConnection(..)
-       , HworkerConfig(..)
        , defaultHworkerConfig
+         -- * Managing Workers
        , create
        , createWith
        , destroy
-       , queue
        , worker
        , monitor
+         -- * Queuing Jobs
+       , queue
+         -- * Inspecting Workers
        , jobs
        , failed
        , broken
+         -- * Debugging Utilities
        , debugger
        )
        where
 
-import           Control.Arrow           ((***))
+import           Control.Arrow           (second)
 import           Control.Concurrent      (forkIO, threadDelay)
 import           Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import           Control.Exception       (SomeException, catch)
@@ -39,7 +56,8 @@ import           Data.Aeson.Helpers
 import           Data.ByteString         (ByteString)
 import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
-import           Data.Maybe              (catMaybes, fromJust)
+import           Data.Either             (isRight)
+import           Data.Maybe              (fromJust, mapMaybe)
 import           Data.Monoid             ((<>))
 import           Data.Text               (Text)
 import qualified Data.Text               as T
@@ -52,7 +70,9 @@ import qualified Data.UUID.V4            as UUID
 import qualified Database.Redis          as R
 import           GHC.Generics            (Generic)
 
-
+-- | Jobs can return 'Success', 'Retry' (with a message), or 'Failure'
+-- (with a message). Jobs that return 'Failure' are stored in the
+-- 'failed' queue and are not re-run. Jobs that return 'Retry' are re-run.
 data Result = Success
             | Retry Text
             | Failure Text
@@ -60,16 +80,44 @@ data Result = Success
 instance ToJSON Result
 instance FromJSON Result
 
+-- | Each Worker that you create will be responsible for one type of
+-- job, defined by a 'Job' instance.
+--
+-- The job can do many different things (as the value can be a
+-- variant), but be careful not to break deserialization if you add
+-- new things it can do.
+--
+-- The job will take some state (passed as the `s` parameter), which
+-- does not vary based on the job, and the actual job data
+-- structure. The data structure (the `t` parameter) will be stored
+-- and copied a few times in Redis while in the lifecycle, so
+-- generally it is a good idea for it to be relatively small (and have
+-- it be able to look up data that it needs while the job in running).
+--
+-- Finally, while deriving FromJSON and ToJSON instances automatically
+-- might seem like a good idea, you will most likely be better off
+-- defining them manually, so you can make sure they are backwards
+-- compatible if you change them, as any jobs that can't be
+-- deserialized will not be run (and will end up in the 'broken'
+-- queue). This will only happen if the queue is non-empty when you
+-- replce the running application version, but this is obviously
+-- possible and could be likely depending on your use.
 class (FromJSON t, ToJSON t, Show t) => Job s t | s -> t where
   job :: s -> t -> IO Result
 
 data JobData t = JobData UTCTime t
 
+-- | What should happen when an unexpected exception is thrown in a
+-- job - it can be treated as either a 'Failure' (the default) or a
+-- 'Retry' (if you know the only exceptions are triggered by
+-- intermittent problems).
 data ExceptionBehavior = RetryOnException | FailOnException
 
 hwlog :: Show a => Hworker s t -> a -> IO ()
 hwlog hw a = hworkerLogger hw (hworkerName hw, a)
 
+-- | The worker data type - it is parametrized be the worker
+-- state (the `s`) and the job type (the `t`).
 data Hworker s t =
      Hworker { hworkerName              :: ByteString
              , hworkerState             :: s
@@ -81,21 +129,52 @@ data Hworker s t =
              , hworkerDebug             :: Bool
              }
 
+-- | When configuring a worker, you can tell it to use an existing
+-- redis connection pool (which you may have for the rest of your
+-- application). Otherwise, you can specify connection info. By
+-- default, hworker tries to connect to localhost, which may not be
+-- true for your production application.
 data RedisConnection = RedisConnectInfo R.ConnectInfo
                      | RedisConnection R.Connection
 
+-- | The main configuration for workers.
+--
+-- Each pool of workers should have a unique `hwconfigName`, as the
+-- queues are set up by that name, and if you have different types of
+-- data written in, they will likely be unable to be deserialized (and
+-- thus could end up in the 'broken' queue).
+--
+-- The 'hwconfigLogger' defaults to writing to stdout, so you will
+-- likely want to replace that with something appropriate (like from a
+-- logging package).
+--
+-- The `hwconfigTimeout` is really important. It determines the length
+-- of time after a job is started before the 'monitor' will decide
+-- that the job must have died and will restart it. If it is shorter
+-- than the length of time that a normal job takes to complete, the
+-- jobs _will_ be run multiple times. This is _semantically_ okay, as
+-- this is an at-least-once processor, but obviously won't be
+-- desirable. It defaults to 120 seconds.
+--
+-- The 'hwconfigExceptionBehavior' controls what happens when an
+-- exception is thrown within a job.
+--
+-- 'hwconfigFailedQueueSize' controls how many 'failed' jobs will be
+-- kept. It defaults to 1000.
 data HworkerConfig s =
      HworkerConfig {
          hwconfigName              :: Text
        , hwconfigState             :: s
        , hwconfigRedisConnectInfo  :: RedisConnection
        , hwconfigExceptionBehavior :: ExceptionBehavior
-       , hwconfigLogger            :: (forall a. Show a => a -> IO ())
+       , hwconfigLogger            :: forall a. Show a => a -> IO ()
        , hwconfigTimeout           :: NominalDiffTime
        , hwconfigFailedQueueSize   :: Int
        , hwconfigDebug             :: Bool
        }
 
+-- | The default worker config - it needs a name and a state (as those
+-- will always be unique).
 defaultHworkerConfig :: Text -> s -> HworkerConfig s
 defaultHworkerConfig name state =
   HworkerConfig name
@@ -107,9 +186,19 @@ defaultHworkerConfig name state =
                 1000
                 False
 
+-- | Create a new worker with the default 'HworkerConfig'.
+--
+-- Note that you must create at least one 'worker' and 'monitor' for
+-- the queue to actually process jobs (and for it to retry ones that
+-- time-out).
 create :: Job s t => Text -> s -> IO (Hworker s t)
 create name state = createWith (defaultHworkerConfig name state)
 
+-- | Create a new worker with a specified 'HworkerConfig'.
+--
+-- Note that you must create at least one 'worker' and 'monitor' for
+-- the queue to actually process jobs (and for it to retry ones that
+-- time-out).
 createWith :: Job s t => HworkerConfig s -> IO (Hworker s t)
 createWith HworkerConfig{..} =
    do conn <- case hwconfigRedisConnectInfo of
@@ -124,10 +213,16 @@ createWith HworkerConfig{..} =
                        hwconfigFailedQueueSize
                        hwconfigDebug
 
-
+-- | Destroy a worker. This will delete all the queues, clearing out
+-- all existing 'jobs', the 'broken' and 'failed' queues. There is no need
+-- to do this in normal applications (and most likely, you won't want to).
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw = void $ R.runRedis (hworkerConnection hw) $
-               R.del [(jobQueue hw), (progressQueue hw), (brokenQueue hw), (failedQueue hw)]
+               R.del [ jobQueue hw
+                     , progressQueue hw
+                     , brokenQueue hw
+                     , failedQueue hw
+                     ]
 
 jobQueue :: Hworker s t -> ByteString
 jobQueue hw = "hworker-jobs-" <> hworkerName hw
@@ -141,12 +236,17 @@ brokenQueue hw = "hworker-broken-" <> hworkerName hw
 failedQueue :: Hworker s t -> ByteString
 failedQueue hw = "hworker-failed-" <> hworkerName hw
 
-queue :: Job s t => Hworker s t -> t -> IO ()
+-- | Adds a job to the queue. Returns whether the operation succeeded.
+queue :: Job s t => Hworker s t -> t -> IO Bool
 queue hw j =
   do job_id <- UUID.toString <$> UUID.nextRandom
-     void $ R.runRedis (hworkerConnection hw) $
-            R.lpush (jobQueue hw) [LB.toStrict $ A.encode (job_id, j)]
+     isRight <$> R.runRedis (hworkerConnection hw)
+                (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (job_id, j)])
 
+-- | Creates a new worker thread. This is blocking, so you will want to
+-- 'forkIO' this into a thread. You can have any number of these (and
+-- on any number of servers); the more there are, the faster jobs will
+-- be processed.
 worker :: Job s t => Hworker s t -> IO ()
 worker hw =
   do now <- getCurrentTime
@@ -229,34 +329,48 @@ worker hw =
                  return (b ("Exception raised: " <> (T.pack . show) e))
                Right r -> return r
 
+
+-- | Start a monitor. Like 'worker', this is blocking, so should be
+-- started in a thread. This is responsible for retrying jobs that
+-- time out (which can happen if the processing thread is killed, for
+-- example). You need to have at least one of these running to have
+-- the retry happen, but it is safe to have any number running.
 monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $
   do now <- getCurrentTime
      withList hw (R.hkeys (progressQueue hw))
        (\jobs ->
-          do void $ forM jobs $ \job ->
-              withMaybe hw (R.hget (progressQueue hw) job)
-               (\start ->
-                  do when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > (hworkerJobTimeout hw)) $
-                       do n <-
-                            withInt hw
-                              (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
-                                      \if del == 1 then\
-                                      \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
-                                      \return del"
-                                      [jobQueue hw, progressQueue hw]
-                                      [job])
-                          when (hworkerDebug hw) $ hwlog hw ("MONITOR RV", n)
-                          when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
+          void $ forM jobs $ \job ->
+            withMaybe hw (R.hget (progressQueue hw) job)
+             (\start ->
+                when (diffUTCTime now (fromJust $ decodeValue (LB.fromStrict start)) > hworkerJobTimeout hw) $
+                  do n <-
+                       withInt hw
+                         (R.eval "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
+                                 \if del == 1 then\
+                                 \  redis.call('rpush', KEYS[1], ARGV[1])\n\                                   \end\n\
+                                 \return del"
+                                 [jobQueue hw, progressQueue hw]
+                                 [job])
+                     when (hworkerDebug hw) $ hwlog hw ("MONITOR RV", n)
+                     when (hworkerDebug hw && n == 1) $ hwlog hw ("MONITOR REQUEUED", job)))
      -- NOTE(dbp 2015-07-25): We check every 1/10th of timeout.
-     threadDelay (floor $ 100000 * (hworkerJobTimeout hw))
+     threadDelay (floor $ 100000 * hworkerJobTimeout hw)
 
+-- | Returns the jobs that could not be deserialized, most likely
+-- because you changed the 'ToJSON'/'FromJSON' instances for you job
+-- in a way that resulted in old jobs not being able to be converted
+-- back from json. Another reason for jobs to end up here (and much
+-- worse) is if you point two instances of 'Hworker', with different
+-- job types, at the same queue (ie, you re-use the name). Then
+-- anytime a worker from one queue gets a job from the other it would
+-- think it is broken.
 broken :: Hworker s t -> IO [(ByteString, UTCTime)]
 broken hw = do r <- R.runRedis (hworkerConnection hw) (R.hgetall (brokenQueue hw))
                case r of
                  Left err -> hwlog hw err >> return []
-                 Right xs -> return (map (id *** parseTime) xs)
+                 Right xs -> return (map (second parseTime) xs)
   where parseTime = fromJust . decodeValue . LB.fromStrict
 
 jobsFromQueue :: Job s t => Hworker s t -> ByteString -> IO [t]
@@ -265,14 +379,21 @@ jobsFromQueue hw queue =
      case r of
        Left err -> hwlog hw err >> return []
        Right [] -> return []
-       Right xs -> return $ catMaybes $ map (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
+       Right xs -> return $ mapMaybe (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
 
+-- | Returns all pending jobs.
 jobs :: Job s t => Hworker s t -> IO [t]
 jobs hw = jobsFromQueue hw (jobQueue hw)
 
+-- | Returns all failed jobs. This is capped at the most recent
+-- 'hworkerconfigFailedQueueSize' jobs that returned 'Failure' (or
+-- threw an exception when 'hworkerconfigExceptionBehavior' is
+-- 'FailOnException').
 failed :: Job s t => Hworker s t -> IO [t]
 failed hw = jobsFromQueue hw (failedQueue hw)
 
+-- | Logs the contents of the jobqueue and the inprogress queue at
+-- `microseconds` intervals.
 debugger :: Job s t => Int -> Hworker s t -> IO ()
 debugger microseconds hw =
   forever $
