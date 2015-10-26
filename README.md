@@ -39,6 +39,10 @@ from the queue, whereas jobs that return `Retry` are added again. The
 only difference between a `Success` and a `Failure` is that a
 `Failure` returns a message that is logged (ie, neither run again).
 
+## Example
+
+See the `example` directory in the repository.
+
 ## Semantics
 
 This behavior of this queue processor is at-least-once.
