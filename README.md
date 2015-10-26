@@ -63,15 +63,13 @@ Any deviations from this behavior are considered bugs that will be fixed.
 Under the hood, we will have the following data structures in redis
 (`name` is set when you create the `hworker` instance):
 
-```
-hworker-jobs-name: list of json serialized job descriptions
+`hworker-jobs-name`: list of json serialized job descriptions
 
-hworker-progress-name: a hash of jobs that are in progress, mapping to time started
+`hworker-progress-name`: a hash of jobs that are in progress, mapping to time started
 
-hworker-broken-name: a hash of jobs to time that couldn't be deserialized; most likely means you changed the serialization format with jobs still in queue, _or_ you pointed different applications at the same queues.
+`hworker-broken-name`: a hash of jobs to time that couldn't be deserialized; most likely means you changed the serialization format with jobs still in queue, _or_ you pointed different applications at the same queues.
 
-hworker-failed-queue: a record of the jobs that failed (limited in size based on config).
-```
+`hworker-failed-queue`: a record of the jobs that failed (limited in size based on config).
 
 In the following pseudo-code, I'm using `MULTI`...`EXEC` to indicate
 atomic blocks of code. These are actually implemented with lua and

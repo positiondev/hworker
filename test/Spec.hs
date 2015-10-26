@@ -133,7 +133,7 @@ main = hspec $
                                            (SimpleState mvar))
                wthread <- forkIO (worker hworker)
                replicateM_ 1000 (queue hworker SimpleJob)
-               threadDelay 1000000
+               threadDelay 2000000
                killThread wthread
                destroy hworker
                v <- takeMVar mvar
