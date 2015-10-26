@@ -4,7 +4,10 @@
 is vaguely inspired by `sidekiq` for Ruby. It is intended to be a
 simple reliable mechanism for processing background tasks. The jobs
 can be created by a Haskell application or any application that can
-push JSON data structures of the right shape into a Redis queue.
+push JSON data structures of the right shape into a Redis queue. The
+application that processes the jobs need not be the same one as the
+application that creates them (they just need to be able to talk to
+the same Redis server, and use the same serialization to/from JSON).
 
 ## Stability
 

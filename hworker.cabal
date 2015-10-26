@@ -8,7 +8,7 @@ license-file:        LICENSE
 author:              Daniel Patterson
 maintainer:          dbp@dbpmail.net
 build-type:          Simple
-extra-source-files:  README.md
+extra-source-files:  README.md CHANGELOG.md
 cabal-version:       >=1.10
 
 library
