@@ -1,5 +1,6 @@
 flags: {}
 packages:
 - '.'
+- 'example'
 extra-deps: []
 resolver: lts-3.1

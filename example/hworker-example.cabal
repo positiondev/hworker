@@ -1,0 +1,27 @@
+name:                hworker-example
+version:             0.1.0.0
+synopsis:            Example for Hworker.
+description:         See README.
+homepage:            http://github.com/dbp/hworker
+license:             ISC
+license-file:        LICENSE
+author:              Daniel Patterson
+maintainer:          dbp@dbpmail.net
+build-type:          Simple
+extra-source-files:  README.md CHANGELOG.md
+cabal-version:       >=1.10
+
+
+executable hworker-example
+  hs-source-dirs: src
+  main-is: Main.hs
+  build-depends:       base >= 4.7 && < 5
+                     , aeson
+                     , hedis >= 0.6.5
+                     , text
+                     , bytestring
+                     , time >= 1.5
+                     , attoparsec
+                     , uuid >= 1.2.6
+                     , hworker
+  default-language:    Haskell2010

@@ -32,7 +32,6 @@ main = do mvar <- newMVar 3
           hworker <- create "printer" (State mvar)
           forkIO (worker hworker)
           forkIO (monitor hworker)
-          queue hworker PrintA
-          -- forkIO (forever $ queue hworker PrintA >> threadDelay 1000000)
-          -- forkIO (forever $ queue hworker PrintB >> threadDelay 500000)
+          forkIO (forever $ queue hworker PrintA >> threadDelay 1000000)
+          forkIO (forever $ queue hworker PrintB >> threadDelay 500000)
           forever (threadDelay 1000000)
