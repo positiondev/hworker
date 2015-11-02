@@ -6,7 +6,6 @@
 {-# LANGUAGE RankNTypes                #-}
 {-# LANGUAGE RecordWildCards           #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
-{-# LANGUAGE StandaloneDeriving        #-}
 
 {-|
 
@@ -16,6 +15,31 @@ acknowledged it, and guaranteeing the atomicity that is specified for
 commands like EVAL (ie, that if you do several things within an EVAL,
 they will all happen or none will happen). Nothing has been tested
 with Redis clusters (and it likely will not work).
+
+An example use is the following (see the repository for a
+slightly expanded version; also, the test cases in the repository are
+also good examples):
+
+
+> data PrintJob = Print deriving (Generic, Show)
+> data State = State (MVar Int)
+> instance ToJSON PrintJob
+> instance FromJSON PrintJob
+>
+> instance Job State PrintJob where
+>   job (State mvar) Print =
+>     do v <- takeMVar mvar
+>        putMVar mvar (v + 1)
+>        putStrLn $ "A(" ++ show v ++ ")"
+>        return Success
+>
+> main = do mvar <- newMVar 0
+>           hworker <- create "printer" (State mvar)
+>           forkIO (worker hworker)
+>           forkIO (monitor hworker)
+>           forkIO (forever $ queue hworker Print >> threadDelay 1000000)
+>           forever (threadDelay 1000000)
+
 
 -}
 
