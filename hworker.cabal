@@ -2,7 +2,7 @@ name:                hworker
 version:             0.1.0.1
 synopsis:            A reliable at-least-once job queue built on top of redis.
 description:         See README.
-homepage:            http://github.com/dbp/hworker
+homepage:            http://github.com/positiondev/hworker
 license:             ISC
 license-file:        LICENSE
 author:              Daniel Patterson
