@@ -277,7 +277,7 @@ worker hw =
      r <- R.runRedis (hworkerConnection hw) $
             R.eval "local job = redis.call('rpop',KEYS[1])\n\
                    \if job ~= nil then\n\
-                   \  redis.call('hset', KEYS[2], job, ARGV[1])\n\
+                   \  redis.call('hset', KEYS[2], tostring(job), ARGV[1])\n\
                    \  return job\n\
                    \else\n\
                    \  return nil\n\
