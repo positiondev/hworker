@@ -1,3 +1,7 @@
+* 0.2.0 Remeike Forbes
+
+  Coerce jobs to string (to work with Redis 5)
+
 * 0.1.0.1 Daniel Pattersion <dbp@dbpmail.net> 2015-11-1
 
   Add example in haddocks.
