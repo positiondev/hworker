@@ -22,6 +22,7 @@ library
                      , time >= 1.5
                      , attoparsec
                      , uuid >= 1.2.6
+                     , async
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:         -Wall
@@ -40,6 +41,7 @@ Test-Suite hworker-test
                      , time >= 1.5
                      , attoparsec
                      , uuid >= 1.2.6
+                     , async
                      , hspec >= 2
                      , hspec-contrib
                      , HUnit

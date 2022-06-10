@@ -71,6 +71,7 @@ module System.Hworker
 
 import           Control.Arrow           (second)
 import           Control.Concurrent      (forkIO, threadDelay)
+import           Control.Concurrent.Async(withAsync, waitCatch)
 import           Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import           Control.Exception       (SomeException, catch)
 import           Control.Monad           (forM, forever, void, when)
@@ -340,11 +341,7 @@ worker hw =
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
         runJob v =
-          do x <- newEmptyMVar
-             jt <- forkIO (catch (v >>= putMVar x . Right)
-                                 (\(e::SomeException) ->
-                                    putMVar x (Left e)))
-             res <- takeMVar x
+          do res <- withAsync v waitCatch
              case res of
                Left e ->
                  let b = case hworkerExceptionBehavior hw of
