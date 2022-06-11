@@ -265,7 +265,7 @@ main = hspec $
                threadDelay 10000000
                destroy hworker
                v <- takeMVar mvar
-               assertEqual "State should be 2, since monitor thinks it failed" 2 v
+               assertEqual "State should be 1, since first failed" 1 v
           it "should add back multiple jobs after timeout" $
              -- NOTE(dbp 2015-07-23): Similar to the above test, but we
              -- have multiple jobs started, multiple workers killed.
@@ -287,7 +287,7 @@ main = hspec $
                threadDelay 10000000
                destroy hworker
                v <- takeMVar mvar
-               assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
+               assertEqual "State should be 2, since first 2 failed" 2 v
           it "should work with multiple monitors" $
             do mvar <- newMVar 0
                hworker <- createWith (conf "timedworker-3"
@@ -313,7 +313,7 @@ main = hspec $
                threadDelay 30000000
                destroy hworker
                v <- takeMVar mvar
-               assertEqual "State should be 4, since monitor thinks first 2 failed" 4 v
+               assertEqual "State should be 2, since first 2 failed" 2 v
                -- NOTE(dbp 2015-07-24): It would be really great to have a
                -- test that went after a race between the retry logic and
                -- the monitors (ie, assume that the job completed with
