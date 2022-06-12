@@ -72,7 +72,9 @@ module System.Hworker
 import           Control.Arrow           (second)
 import           Control.Concurrent      (forkIO, threadDelay)
 import           Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import           Control.Exception       (SomeException, catch)
+import           Control.Exception       (SomeException, catchJust,
+                                          asyncExceptionFromException,
+                                          AsyncException)
 import           Control.Monad           (forM, forever, void, when)
 import           Data.Aeson              (FromJSON, ToJSON)
 import qualified Data.Aeson              as A
@@ -81,7 +83,7 @@ import           Data.ByteString         (ByteString)
 import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
 import           Data.Either             (isRight)
-import           Data.Maybe              (fromJust, mapMaybe)
+import           Data.Maybe              (fromJust, isJust, mapMaybe)
 import           Data.Monoid             ((<>))
 import           Data.Text               (Text)
 import qualified Data.Text               as T
@@ -340,11 +342,16 @@ worker hw =
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
         runJob v =
-          do x <- newEmptyMVar
-             jt <- forkIO (catch (v >>= putMVar x . Right)
-                                 (\(e::SomeException) ->
-                                    putMVar x (Left e)))
-             res <- takeMVar x
+          do res <-
+               catchJust
+                  ( \(e :: SomeException) ->
+                      if isJust (asyncExceptionFromException e :: Maybe AsyncException) then
+                        Nothing
+                      else
+                        Just e
+                  )
+                  ( Right <$> v )
+                  ( \e -> return (Left e) )
              case res of
                Left e ->
                  let b = case hworkerExceptionBehavior hw of
