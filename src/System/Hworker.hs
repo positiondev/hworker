@@ -1,11 +1,12 @@
-{-# LANGUAGE DeriveGeneric             #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE FunctionalDependencies    #-}
-{-# LANGUAGE MultiParamTypeClasses     #-}
-{-# LANGUAGE OverloadedStrings         #-}
-{-# LANGUAGE RankNTypes                #-}
-{-# LANGUAGE RecordWildCards           #-}
-{-# LANGUAGE ScopedTypeVariables       #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE ExistentialQuantification  #-}
+{-# LANGUAGE FunctionalDependencies     #-}
+{-# LANGUAGE GeneralisedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 
 {-|
 
@@ -52,10 +53,12 @@ module System.Hworker
        , ExceptionBehavior(..)
        , RedisConnection(..)
        , defaultHworkerConfig
+       , BatchID(..)
          -- * Managing Workers
        , create
        , createWith
        , destroy
+       , initBatch
        , worker
        , monitor
          -- * Queuing Jobs
@@ -76,7 +79,8 @@ import           Control.Exception       (SomeException, catchJust,
                                           asyncExceptionFromException,
                                           AsyncException)
 import           Control.Monad           (forM, forever, void, when)
-import           Data.Aeson              (FromJSON, ToJSON)
+import           Control.Monad.Trans     (liftIO)
+import           Data.Aeson              (FromJSON, ToJSON, (.=), (.:) )
 import qualified Data.Aeson              as A
 import           Data.Aeson.Helpers
 import           Data.ByteString         (ByteString)
@@ -91,6 +95,7 @@ import qualified Data.Text.Encoding      as T
 import           Data.Time.Calendar      (Day (..))
 import           Data.Time.Clock         (NominalDiffTime, UTCTime (..),
                                           diffUTCTime, getCurrentTime)
+import           Data.UUID                ( UUID )
 import qualified Data.UUID               as UUID
 import qualified Data.UUID.V4            as UUID
 import qualified Database.Redis          as R
@@ -138,6 +143,20 @@ data JobData t = JobData UTCTime t
 -- 'Retry' (if you know the only exceptions are triggered by
 -- intermittent problems).
 data ExceptionBehavior = RetryOnException | FailOnException
+
+type JobID = Text
+
+-- | A unique identifier for grouping jobs together.
+newtype BatchID = BatchID UUID deriving (ToJSON, FromJSON)
+
+data JobRef = JobRef JobID (Maybe BatchID)
+
+instance ToJSON JobRef where
+  toJSON (JobRef j b) = A.object ["j" .= j, "b" .= b]
+
+instance FromJSON JobRef where
+  parseJSON (A.String j) = pure (JobRef j Nothing)
+  parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b") val
 
 hwlog :: Show a => Hworker s t -> a -> IO ()
 hwlog hw a = hworkerLogger hw (hworkerName hw, a)
@@ -262,12 +281,25 @@ brokenQueue hw = "hworker-broken-" <> hworkerName hw
 failedQueue :: Hworker s t -> ByteString
 failedQueue hw = "hworker-failed-" <> hworkerName hw
 
+batchCounter :: Hworker s t -> BatchID -> ByteString
+batchCounter hw (BatchID batch) =
+  "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
+
 -- | Adds a job to the queue. Returns whether the operation succeeded.
 queue :: Job s t => Hworker s t -> t -> IO Bool
 queue hw j =
-  do job_id <- UUID.toString <$> UUID.nextRandom
+  do job_id <- UUID.toText <$> UUID.nextRandom
      isRight <$> R.runRedis (hworkerConnection hw)
-                (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (job_id, j)])
+                (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id Nothing, j)])
+
+queueBatch :: Job s t => Hworker s t -> t -> BatchID -> Bool -> IO Bool
+queueBatch hw j batch finish = do
+  job_id <- UUID.toText <$> UUID.nextRandom
+  R.runRedis (hworkerConnection hw) $ do
+    result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
+    void $ R.hincrby (batchCounter hw batch) "total" 1
+    when finish $ void $ R.hset (batchCounter hw batch) "status" "processing"
+    return $ isRight result
 
 -- | Creates a new worker thread. This is blocking, so you will want to
 -- 'forkIO' this into a thread. You can have any number of these (and
@@ -302,13 +334,16 @@ worker hw =
                                                 [progressQueue hw, brokenQueue hw]
                                                 [t, LB.toStrict $ A.encode now])
                             delayAndRun
-              Just (_ :: String, j) -> do
+              Just (JobRef _ maybeBatch, j) -> do
                 result <- runJob (job (hworkerState hw) j)
                 case result of
                   Success ->
                     do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
                        delete_res <- R.runRedis (hworkerConnection hw)
                                                 (R.hdel (progressQueue hw) [t])
+                       case maybeBatch of
+                         Nothing -> return ()
+                         Just batch -> incBatchSuccesses hw batch
                        case delete_res of
                          Left err -> hwlog hw err >> delayAndRun
                          Right 1 -> justRun
@@ -324,6 +359,9 @@ worker hw =
                                         \return nil"
                                         [progressQueue hw, jobQueue hw]
                                         [t])
+                       case maybeBatch of
+                         Nothing -> return ()
+                         Just batch -> incBatchRetries hw batch
                        delayAndRun
                   Failure msg ->
                     do hwlog hw ("Failure: " <> msg)
@@ -336,6 +374,9 @@ worker hw =
                                         \return nil"
                                         [progressQueue hw, failedQueue hw]
                                         [t, B8.pack (show (hworkerFailedQueueSize hw - 1))])
+                       case maybeBatch of
+                         Nothing -> return ()
+                         Just batch -> incBatchFailures hw batch
                        void $ R.runRedis (hworkerConnection hw)
                                          (R.hdel (progressQueue hw) [t])
                        delayAndRun
@@ -434,6 +475,51 @@ debugger microseconds hw =
                         (\queued -> hwlog hw ("DEBUG", queued, running)))
      threadDelay microseconds
 
+initBatch :: Hworker s t -> IO BatchID
+initBatch hw = do
+  batch <- BatchID <$> UUID.nextRandom
+  R.runRedis (hworkerConnection hw) $
+    R.hmset (batchCounter hw batch)
+      [ ("total", "0")
+      , ("completed", "0")
+      , ("successes", "0")
+      , ("failures", "0")
+      , ("retries", "0")
+      , ("status", "queuing")
+      ]
+  return batch
+
+incBatchSuccesses :: Hworker s t -> BatchID -> IO ()
+incBatchSuccesses hw batch =
+  void $ R.runRedis (hworkerConnection hw) $ do
+    void $ withInt' hw $ R.hincrby (batchCounter hw batch) "successes" 1
+    completeBatch hw batch
+
+incBatchFailures :: Hworker s t -> BatchID -> IO ()
+incBatchFailures hw batch =
+  void $ R.runRedis (hworkerConnection hw) $ do
+    void $ withInt' hw $ R.hincrby (batchCounter hw batch) "failures" 1
+    completeBatch hw batch
+
+incBatchRetries :: Hworker s t -> BatchID -> IO ()
+incBatchRetries hw batch =
+  void $ R.runRedis (hworkerConnection hw) $
+    R.hincrby (batchCounter hw batch) "retries" 1
+
+completeBatch :: Hworker s t -> BatchID -> R.Redis ()
+completeBatch hw batch = do
+  completed <- withInt' hw $ R.hincrby (batchCounter hw batch) "completed" 1
+  total <- withInt' hw $ R.hincrby (batchCounter hw batch) "total" 0
+  withMaybe' hw (R.hget (batchCounter hw batch) "status") $
+    \status ->
+      case status of
+        "processing" | completed >= total ->
+          void $ R.hset (batchCounter hw batch) "status" "processing"
+
+        _ ->
+          return ()
+
+
 -- Redis helpers follow
 withList hw a f =
   do r <- R.runRedis (hworkerConnection hw) a
@@ -469,3 +555,19 @@ withIgnore hw a =
      case r of
        Left err -> hwlog hw err
        Right _ -> return ()
+
+withInt' :: Hworker s t -> R.Redis (Either R.Reply Integer) -> R.Redis Integer
+withInt' hw a =
+  do r <- a
+     case r of
+       Left err -> liftIO (hwlog hw err) >> return (-1)
+       Right n -> return n
+
+
+withMaybe' :: Hworker s t -> R.Redis (Either R.Reply (Maybe a)) -> (a -> R.Redis ()) -> R.Redis ()
+withMaybe' hw a f =
+  do r <- a
+     case r of
+       Left err -> liftIO $ hwlog hw err
+       Right Nothing -> return ()
+       Right (Just v) -> f v
