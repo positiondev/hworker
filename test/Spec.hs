@@ -193,6 +193,7 @@ main = hspec $
                wthread <- forkIO (worker hworker)
                queue hworker RetryJob
                threadDelay 50000
+               killThread wthread
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 2, since it got retried" 2 v
@@ -205,6 +206,7 @@ main = hspec $
                wthread <- forkIO (worker hworker)
                queue hworker FailJob
                threadDelay 30000
+               killThread wthread
                destroy hworker
                v <- takeMVar mvar
                assertEqual "State should be 1, since failing run wasn't retried" 1 v
@@ -215,6 +217,7 @@ main = hspec $
                wthread <- forkIO (worker hworker)
                queue hworker FailJob
                threadDelay 30000
+               killThread wthread
                jobs <- failed hworker
                destroy hworker
                assertEqual "Should have failed job" [FailJob] jobs
@@ -230,6 +233,7 @@ main = hspec $
                queue hworker AlwaysFailJob
                queue hworker AlwaysFailJob
                threadDelay 100000
+               killThread wthread
                jobs <- failed hworker
                destroy hworker
                v <- takeMVar mvar

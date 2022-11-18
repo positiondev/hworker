@@ -147,9 +147,9 @@ data ExceptionBehavior = RetryOnException | FailOnException
 type JobID = Text
 
 -- | A unique identifier for grouping jobs together.
-newtype BatchID = BatchID UUID deriving (ToJSON, FromJSON)
+newtype BatchID = BatchID UUID deriving (ToJSON, FromJSON, Eq, Show)
 
-data JobRef = JobRef JobID (Maybe BatchID)
+data JobRef = JobRef JobID (Maybe BatchID) deriving (Eq, Show)
 
 instance ToJSON JobRef where
   toJSON (JobRef j b) = A.object ["j" .= j, "b" .= b]
@@ -292,8 +292,8 @@ queue hw j =
      isRight <$> R.runRedis (hworkerConnection hw)
                 (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id Nothing, j)])
 
-queueBatch :: Job s t => Hworker s t -> t -> BatchID -> Bool -> IO Bool
-queueBatch hw j batch finish = do
+queueBatched :: Job s t => Hworker s t -> t -> BatchID -> Bool -> IO Bool
+queueBatched hw j batch finish = do
   job_id <- UUID.toText <$> UUID.nextRandom
   R.runRedis (hworkerConnection hw) $ do
     result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
@@ -451,7 +451,7 @@ jobsFromQueue hw queue =
      case r of
        Left err -> hwlog hw err >> return []
        Right [] -> return []
-       Right xs -> return $ mapMaybe (fmap (\(_::String, x) -> x) . decodeValue . LB.fromStrict) xs
+       Right xs -> return $ mapMaybe (fmap (\(JobRef _ _, x) -> x) . decodeValue . LB.fromStrict) xs
 
 -- | Returns all pending jobs.
 jobs :: Job s t => Hworker s t -> IO [t]
