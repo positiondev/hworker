@@ -240,6 +240,84 @@ main = hspec $
                assertEqual "State should be 4, since all jobs were run" 4 v
                assertEqual "Should only have stored 2"
                            [AlwaysFailJob,AlwaysFailJob] jobs
+
+     fdescribe "Batch" $
+       do it "should set up a batch job" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               Just batch <- initBatch hworker >>= batchJob hworker
+               batchTotal batch `shouldBe` 0
+               batchCompleted batch `shouldBe` 0
+               batchSuccesses batch `shouldBe` 0
+               batchFailures batch `shouldBe` 0
+               batchRetries batch `shouldBe` 0
+               batchStatus batch `shouldBe` BatchQueuing
+               destroy hworker
+
+          it "should increment batch total after queueing a batch job" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               ref <- initBatch hworker
+               queueBatched hworker SimpleJob ref False
+               Just batch <- batchJob hworker ref
+               batchTotal batch `shouldBe` 1
+               destroy hworker
+
+          it "should increment success and completed after completing a successful batch job" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               wthread <- forkIO (worker hworker)
+               ref <- initBatch hworker
+               queueBatched hworker SimpleJob ref False
+               threadDelay 30000
+               Just batch <- batchJob hworker ref
+               batchTotal batch `shouldBe` 1
+               batchFailures batch `shouldBe` 0
+               batchSuccesses batch `shouldBe` 1
+               batchCompleted batch `shouldBe` 1
+               batchStatus batch `shouldBe` BatchQueuing
+               killThread wthread
+               destroy hworker
+
+          it "should increment failure and completed after completing a failed batch job" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "failworker-1" (FailState mvar))
+               wthread <- forkIO (worker hworker)
+               ref <- initBatch hworker
+               queueBatched hworker FailJob ref False
+               threadDelay 30000
+               Just batch <- batchJob hworker ref
+               batchTotal batch `shouldBe` 1
+               batchFailures batch `shouldBe` 1
+               batchSuccesses batch `shouldBe` 0
+               batchCompleted batch `shouldBe` 1
+               batchStatus batch `shouldBe` BatchQueuing
+               killThread wthread
+               destroy hworker
+
+          it "should change job status to processing when indicated in queued job" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               ref <- initBatch hworker
+               queueBatched hworker SimpleJob ref True
+               Just batch <- batchJob hworker ref
+               batchTotal batch `shouldBe` 1
+               batchStatus batch `shouldBe` BatchProcessing
+               destroy hworker
+
+          it "should change job status finished when last process" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               wthread <- forkIO (worker hworker)
+               ref <- initBatch hworker
+               queueBatched hworker SimpleJob ref True
+               threadDelay 30000
+               Just batch <- batchJob hworker ref
+               batchTotal batch `shouldBe` 1
+               batchStatus batch `shouldBe` BatchFinished
+               killThread wthread
+               destroy hworker
+
      describe "Monitor" $
        do it "should add job back after timeout" $
           -- NOTE(dbp 2015-07-12): The timing on this test is somewhat

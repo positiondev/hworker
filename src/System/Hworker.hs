@@ -54,15 +54,19 @@ module System.Hworker
        , RedisConnection(..)
        , defaultHworkerConfig
        , BatchID(..)
+       , BatchStatus(..)
+       , BatchJob(..)
          -- * Managing Workers
        , create
        , createWith
        , destroy
-       , initBatch
+       , batchJob
        , worker
        , monitor
          -- * Queuing Jobs
        , queue
+       , queueBatched
+       , initBatch
          -- * Inspecting Workers
        , jobs
        , failed
@@ -87,7 +91,7 @@ import           Data.ByteString         (ByteString)
 import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
 import           Data.Either             (isRight)
-import           Data.Maybe              (fromJust, isJust, mapMaybe)
+import           Data.Maybe              (fromJust, isJust, mapMaybe, listToMaybe)
 import           Data.Monoid             ((<>))
 import           Data.Text               (Text)
 import qualified Data.Text               as T
@@ -148,6 +152,31 @@ type JobID = Text
 
 -- | A unique identifier for grouping jobs together.
 newtype BatchID = BatchID UUID deriving (ToJSON, FromJSON, Eq, Show)
+
+data BatchStatus = BatchQueuing | BatchProcessing | BatchFinished
+  deriving (Eq, Show)
+
+encodeBatchStatus :: BatchStatus -> ByteString
+encodeBatchStatus BatchQueuing    = "queueing"
+encodeBatchStatus BatchProcessing = "processing"
+encodeBatchStatus BatchFinished   = "finished"
+
+decodeBatchStatus :: ByteString -> Maybe BatchStatus
+decodeBatchStatus "queueing"   = Just BatchQueuing
+decodeBatchStatus "processing" = Just BatchProcessing
+decodeBatchStatus "finished"   = Just BatchFinished
+decodeBatchStatus _            = Nothing
+
+data BatchJob =
+  BatchJob
+    { batchID        :: BatchID
+    , batchTotal     :: Int
+    , batchCompleted :: Int
+    , batchSuccesses :: Int
+    , batchFailures  :: Int
+    , batchRetries   :: Int
+    , batchStatus    :: BatchStatus
+    }
 
 data JobRef = JobRef JobID (Maybe BatchID) deriving (Eq, Show)
 
@@ -262,7 +291,8 @@ createWith HworkerConfig{..} =
 -- all existing 'jobs', the 'broken' and 'failed' queues. There is no need
 -- to do this in normal applications (and most likely, you won't want to).
 destroy :: Job s t => Hworker s t -> IO ()
-destroy hw = void $ R.runRedis (hworkerConnection hw) $
+destroy hw = void $ R.runRedis (hworkerConnection hw) $ do
+               keys <- withList' hw (R.keys $ "hworker-batch-" <> hworkerName hw <> "*") (void . R.del)
                R.del [ jobQueue hw
                      , progressQueue hw
                      , brokenQueue hw
@@ -298,7 +328,7 @@ queueBatched hw j batch finish = do
   R.runRedis (hworkerConnection hw) $ do
     result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
     void $ R.hincrby (batchCounter hw batch) "total" 1
-    when finish $ void $ R.hset (batchCounter hw batch) "status" "processing"
+    when finish . void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
     return $ isRight result
 
 -- | Creates a new worker thread. This is blocking, so you will want to
@@ -485,9 +515,25 @@ initBatch hw = do
       , ("successes", "0")
       , ("failures", "0")
       , ("retries", "0")
-      , ("status", "queuing")
+      , ("status", "queueing")
       ]
   return batch
+
+batchJob :: Hworker s t -> BatchID -> IO (Maybe BatchJob)
+batchJob hw batch = do
+  r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
+  case r of
+    Left err -> hwlog hw err >> return Nothing
+    Right hm ->
+      return $
+        BatchJob
+          <$> pure batch
+          <*> (lookup "total" hm >>= readMaybe)
+          <*> (lookup "completed" hm >>= readMaybe)
+          <*> (lookup "successes" hm >>= readMaybe)
+          <*> (lookup "failures" hm >>= readMaybe)
+          <*> (lookup "retries" hm >>= readMaybe)
+          <*> (lookup "status" hm >>= decodeBatchStatus)
 
 incBatchSuccesses :: Hworker s t -> BatchID -> IO ()
 incBatchSuccesses hw batch =
@@ -514,7 +560,7 @@ completeBatch hw batch = do
     \status ->
       case status of
         "processing" | completed >= total ->
-          void $ R.hset (batchCounter hw batch) "status" "processing"
+          void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchFinished)
 
         _ ->
           return ()
@@ -556,6 +602,14 @@ withIgnore hw a =
        Left err -> hwlog hw err
        Right _ -> return ()
 
+
+withList' hw a f =
+  do r <- a
+     case r of
+       Left err -> liftIO $ hwlog hw err
+       Right [] -> return ()
+       Right xs -> f xs
+
 withInt' :: Hworker s t -> R.Redis (Either R.Reply Integer) -> R.Redis Integer
 withInt' hw a =
   do r <- a
@@ -571,3 +625,7 @@ withMaybe' hw a f =
        Left err -> liftIO $ hwlog hw err
        Right Nothing -> return ()
        Right (Just v) -> f v
+
+readMaybe :: Read a => ByteString -> Maybe a
+readMaybe =
+  fmap fst . listToMaybe . reads . B8.unpack
