@@ -176,7 +176,7 @@ data BatchJob =
     , batchFailures  :: Int
     , batchRetries   :: Int
     , batchStatus    :: BatchStatus
-    }
+    } deriving Show
 
 data JobRef = JobRef JobID (Maybe BatchID) deriving (Eq, Show)
 
@@ -371,47 +371,117 @@ worker hw =
                 case result of
                   Success ->
                     do when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE", t)
-                       delete_res <- R.runRedis (hworkerConnection hw)
-                                                (R.hdel (progressQueue hw) [t])
                        case maybeBatch of
-                         Nothing -> return ()
-                         Just batch -> incBatchSuccesses hw batch
-                       case delete_res of
-                         Left err -> hwlog hw err >> delayAndRun
-                         Right 1 -> justRun
-                         Right n -> do hwlog hw ("Job done: did not delete 1, deleted " <> show n)
-                                       delayAndRun
+                         Nothing -> do
+                           delete_res <- R.runRedis (hworkerConnection hw)
+                                                    (R.hdel (progressQueue hw) [t])
+                           case delete_res of
+                             Left err -> hwlog hw err >> delayAndRun
+                             Right 1 -> justRun
+                             Right n -> do hwlog hw ("Job done: did not delete 1, deleted " <> show n)
+                                           delayAndRun
+
+                         Just batch ->
+                           withMaybe hw
+                             (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                     \if del == 1 then\n\
+                                     \  local batch = KEYS[2]\n\
+                                     \  redis.call('hincrby', batch, 'successes', '1')\n\
+                                     \  local completed = redis.call('hincrby', batch, 'completed', '1')\n\
+                                     \  local total = redis.call('hincrby', batch, 'total', '0')\n\
+                                     \  local status = redis.call('hget', batch, 'status')\n\
+                                     \  if tonumber(completed) >= tonumber(total) and status == 'processing' then\n\
+                                     \    redis.call('hset', batch, 'status', 'finished')\n\
+                                     \  end\n\
+                                     \  return redis.call('hgetall', batch)\
+                                     \end\n\
+                                     \return nil"
+                                     [progressQueue hw, batchCounter hw batch]
+                                     [t]
+                             )
+                             (\r ->
+                                 case decodeBatchSummary batch r of
+                                   Nothing -> do
+                                     hwlog hw ("Job done: did not delete 1" :: Text)
+                                     delayAndRun
+
+                                   Just summary -> do
+                                     when (batchStatus summary == BatchFinished)
+                                       $ hworkerBatchCompleted hw summary
+                                     justRun
+                             )
+
+
                   Retry msg ->
                     do hwlog hw ("Retry: " <> msg)
-                       withNil hw
-                                (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
-                                        \if del == 1 then\n\
-                                        \  redis.call('lpush', KEYS[2], ARGV[1])\n\
-                                        \end\n\
-                                        \return nil"
-                                        [progressQueue hw, jobQueue hw]
-                                        [t])
                        case maybeBatch of
-                         Nothing -> return ()
-                         Just batch -> incBatchRetries hw batch
-                       delayAndRun
+                         Nothing -> do
+                           withNil hw
+                                     (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                             \if del == 1 then\n\
+                                             \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                             \end\n\
+                                             \return nil"
+                                             [progressQueue hw, jobQueue hw]
+                                             [t])
+                           delayAndRun
+
+                         Just batch -> do
+                           withNil hw
+                                     (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                             \if del == 1 then\n\
+                                             \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                             \  redis.call('hincrby', KEYS[3], 'retries', '1')\n\
+                                             \end\n\
+                                             \return nil"
+                                             [progressQueue hw, jobQueue hw, batchCounter hw batch]
+                                             [t])
+                           delayAndRun
+
                   Failure msg ->
                     do hwlog hw ("Failure: " <> msg)
-                       withNil hw
-                                (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
-                                        \if del == 1 then\n\
-                                        \  redis.call('lpush', KEYS[2], ARGV[1])\n\
-                                        \  redis.call('ltrim', KEYS[2], 0, ARGV[2])\n\
-                                        \end\n\
-                                        \return nil"
-                                        [progressQueue hw, failedQueue hw]
-                                        [t, B8.pack (show (hworkerFailedQueueSize hw - 1))])
                        case maybeBatch of
-                         Nothing -> return ()
-                         Just batch -> incBatchFailures hw batch
-                       void $ R.runRedis (hworkerConnection hw)
-                                         (R.hdel (progressQueue hw) [t])
-                       delayAndRun
+                         Nothing -> do
+                           withNil hw
+                                    (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                            \if del == 1 then\n\
+                                            \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                            \  redis.call('ltrim', KEYS[2], 0, ARGV[2])\n\
+                                            \end\n\
+                                            \return nil"
+                                            [progressQueue hw, failedQueue hw]
+                                            [t, B8.pack (show (hworkerFailedQueueSize hw - 1))])
+                           void $ R.runRedis (hworkerConnection hw)
+                                             (R.hdel (progressQueue hw) [t])
+                           delayAndRun
+
+                         Just batch -> do
+                           withMaybe hw
+                             (R.eval "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
+                                     \if del == 1 then\n\
+                                     \  redis.call('lpush', KEYS[2], ARGV[1])\n\
+                                     \  redis.call('ltrim', KEYS[2], 0, ARGV[2])\n\
+                                     \  local batch = KEYS[3]\n\
+                                     \  redis.call('hincrby', batch, 'failures', '1')\n\
+                                     \  local completed = redis.call('hincrby', batch, 'completed', '1')\n\
+                                     \  local total = redis.call('hincrby', batch, 'total', '0')\n\
+                                     \  local status = redis.call('hget', batch, 'status')\n\
+                                     \  if tonumber(completed) >= tonumber(total) and status == 'processing' then\n\
+                                     \    redis.call('hset', batch, 'status', 'finished')\n\
+                                     \    return redis.call('hgetall', batch)\
+                                     \  end\n\
+                                     \end\n\
+                                     \return nil"
+                                     [progressQueue hw, failedQueue hw, batchCounter hw batch]
+                                     [t, B8.pack (show (hworkerFailedQueueSize hw - 1))]
+                             )
+                             (\r ->
+                                case decodeBatchSummary batch r of
+                                  Nothing -> return ()
+                                  Just summary -> hworkerBatchCompleted hw summary
+                             )
+                           delayAndRun
+
   where delayAndRun = threadDelay 10000 >> worker hw
         justRun = worker hw
         runJob v =
@@ -526,52 +596,18 @@ batchJob hw batch = do
   r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
   case r of
     Left err -> hwlog hw err >> return Nothing
-    Right hm ->
-      return $
-        BatchJob
-          <$> pure batch
-          <*> (lookup "total" hm >>= readMaybe)
-          <*> (lookup "completed" hm >>= readMaybe)
-          <*> (lookup "successes" hm >>= readMaybe)
-          <*> (lookup "failures" hm >>= readMaybe)
-          <*> (lookup "retries" hm >>= readMaybe)
-          <*> (lookup "status" hm >>= decodeBatchStatus)
+    Right hm -> return $ decodeBatchSummary batch hm
 
-incBatchSuccesses :: Hworker s t -> BatchID -> IO ()
-incBatchSuccesses hw batch =
-  void $ R.runRedis (hworkerConnection hw) $ do
-    void $ withInt' hw $ R.hincrby (batchCounter hw batch) "successes" 1
-    completeBatch hw batch
-
-incBatchFailures :: Hworker s t -> BatchID -> IO ()
-incBatchFailures hw batch =
-  void $ R.runRedis (hworkerConnection hw) $ do
-    void $ withInt' hw $ R.hincrby (batchCounter hw batch) "failures" 1
-    completeBatch hw batch
-
-incBatchRetries :: Hworker s t -> BatchID -> IO ()
-incBatchRetries hw batch =
-  void $ R.runRedis (hworkerConnection hw) $
-    R.hincrby (batchCounter hw batch) "retries" 1
-
-completeBatch :: Hworker s t -> BatchID -> R.Redis ()
-completeBatch hw batch = do
-  completed <- withInt' hw $ R.hincrby (batchCounter hw batch) "completed" 1
-  total <- withInt' hw $ R.hincrby (batchCounter hw batch) "total" 0
-  withMaybe' hw (R.hget (batchCounter hw batch) "status") $
-    \status ->
-      case status of
-        "processing" | completed >= total -> do
-          void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchFinished)
-          liftIO $ do
-            r <- batchJob hw batch
-            case r of
-              Nothing -> hwlog hw ("Batch Job not found" :: Text)
-              Just batchjob -> hworkerBatchCompleted hw batchjob
-
-        _ ->
-          return ()
-
+decodeBatchSummary :: BatchID -> [(ByteString, ByteString)] -> Maybe BatchJob
+decodeBatchSummary batch hm =
+  BatchJob
+    <$> pure batch
+    <*> (lookup "total" hm >>= readMaybe)
+    <*> (lookup "completed" hm >>= readMaybe)
+    <*> (lookup "successes" hm >>= readMaybe)
+    <*> (lookup "failures" hm >>= readMaybe)
+    <*> (lookup "retries" hm >>= readMaybe)
+    <*> (lookup "status" hm >>= decodeBatchStatus)
 
 -- Redis helpers follow
 withList hw a f =
@@ -617,21 +653,6 @@ withList' hw a f =
        Right [] -> return ()
        Right xs -> f xs
 
-withInt' :: Hworker s t -> R.Redis (Either R.Reply Integer) -> R.Redis Integer
-withInt' hw a =
-  do r <- a
-     case r of
-       Left err -> liftIO (hwlog hw err) >> return (-1)
-       Right n -> return n
-
-
-withMaybe' :: Hworker s t -> R.Redis (Either R.Reply (Maybe a)) -> (a -> R.Redis ()) -> R.Redis ()
-withMaybe' hw a f =
-  do r <- a
-     case r of
-       Left err -> liftIO $ hwlog hw err
-       Right Nothing -> return ()
-       Right (Just v) -> f v
 
 readMaybe :: Read a => ByteString -> Maybe a
 readMaybe =
