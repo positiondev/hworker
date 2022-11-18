@@ -241,7 +241,7 @@ main = hspec $
                assertEqual "Should only have stored 2"
                            [AlwaysFailJob,AlwaysFailJob] jobs
 
-     fdescribe "Batch" $
+     describe "Batch" $
        do it "should set up a batch job" $
             do mvar <- newMVar 0
                hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
