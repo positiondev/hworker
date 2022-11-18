@@ -201,6 +201,7 @@ data Hworker s t =
              , hworkerJobTimeout        :: NominalDiffTime
              , hworkerFailedQueueSize   :: Int
              , hworkerDebug             :: Bool
+             , hworkerBatchCompleted    :: BatchJob -> IO ()
              }
 
 -- | When configuring a worker, you can tell it to use an existing
@@ -286,6 +287,7 @@ createWith HworkerConfig{..} =
                        hwconfigTimeout
                        hwconfigFailedQueueSize
                        hwconfigDebug
+                       (const (return ()))
 
 -- | Destroy a worker. This will delete all the queues, clearing out
 -- all existing 'jobs', the 'broken' and 'failed' queues. There is no need
@@ -559,8 +561,13 @@ completeBatch hw batch = do
   withMaybe' hw (R.hget (batchCounter hw batch) "status") $
     \status ->
       case status of
-        "processing" | completed >= total ->
+        "processing" | completed >= total -> do
           void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchFinished)
+          liftIO $ do
+            r <- batchJob hw batch
+            case r of
+              Nothing -> hwlog hw ("Batch Job not found" :: Text)
+              Just batchjob -> hworkerBatchCompleted hw batchjob
 
         _ ->
           return ()
