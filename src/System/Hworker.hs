@@ -59,7 +59,7 @@ module System.Hworker
        , create
        , createWith
        , destroy
-       , batchJob
+       , batchSummary
        , worker
        , monitor
          -- * Queuing Jobs
@@ -607,8 +607,8 @@ initBatch hw = do
       ]
   return batch
 
-batchJob :: Hworker s t -> BatchID -> IO (Maybe BatchSummary)
-batchJob hw batch = do
+batchSummary :: Hworker s t -> BatchID -> IO (Maybe BatchSummary)
+batchSummary hw batch = do
   r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
   case r of
     Left err -> hwlog hw err >> return Nothing
