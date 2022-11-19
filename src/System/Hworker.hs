@@ -451,8 +451,6 @@ worker hw =
                                             \return nil"
                                             [progressQueue hw, failedQueue hw]
                                             [t, B8.pack (show (hworkerFailedQueueSize hw - 1))])
-                           void $ R.runRedis (hworkerConnection hw)
-                                             (R.hdel (progressQueue hw) [t])
                            delayAndRun
 
                          Just batch -> do
