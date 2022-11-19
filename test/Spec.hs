@@ -246,7 +246,7 @@ main = hspec $
             do mvar <- newMVar 0
                hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
                Just batch <- initBatch hworker Nothing >>= batchSummary hworker
-               batchSummaryTotal batch `shouldBe` 0
+               batchSummaryQueued batch `shouldBe` 0
                batchSummaryCompleted batch `shouldBe` 0
                batchSummarySuccesses batch `shouldBe` 0
                batchSummaryFailures batch `shouldBe` 0
@@ -267,7 +267,7 @@ main = hspec $
                ref <- initBatch hworker Nothing
                queueBatched hworker SimpleJob ref
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                destroy hworker
           it "should not enqueue job for completed batch" $
             do mvar <- newMVar 0
@@ -280,7 +280,7 @@ main = hspec $
                queueBatched hworker SimpleJob ref >>= shouldBe False
                threadDelay 30000
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                killThread wthread
                destroy hworker
           it "should increment success and completed after completing a successful batch job" $
@@ -291,7 +291,7 @@ main = hspec $
                queueBatched hworker SimpleJob ref
                threadDelay 30000
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                batchSummaryFailures batch `shouldBe` 0
                batchSummarySuccesses batch `shouldBe` 1
                batchSummaryCompleted batch `shouldBe` 1
@@ -306,24 +306,37 @@ main = hspec $
                queueBatched hworker FailJob ref
                threadDelay 30000
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                batchSummaryFailures batch `shouldBe` 1
                batchSummarySuccesses batch `shouldBe` 0
                batchSummaryCompleted batch `shouldBe` 1
                batchSummaryStatus batch `shouldBe` BatchQueueing
                killThread wthread
                destroy hworker
-          it "should change job status to processing when indicated in queued job" $
+          it "should change job status to processing when batch is set to stop queueing" $
             do mvar <- newMVar 0
                hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
                ref <- initBatch hworker Nothing
                queueBatched hworker SimpleJob ref
                stopBatchQueueing hworker ref
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                batchSummaryStatus batch `shouldBe` BatchProcessing
                destroy hworker
-          it "should change job status finished when last process" $
+          it "should change job status to finished when batch is set to stop queueing and jobs are already run" $
+            do mvar <- newMVar 0
+               hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+               wthread <- forkIO (worker hworker)
+               ref <- initBatch hworker Nothing
+               queueBatched hworker SimpleJob ref
+               threadDelay 30000
+               stopBatchQueueing hworker ref
+               Just batch <- batchSummary hworker ref
+               batchSummaryQueued batch `shouldBe` 1
+               batchSummaryStatus batch `shouldBe` BatchFinished
+               killThread wthread
+               destroy hworker
+          it "should change job status finished when last processed" $
             do mvar <- newMVar 0
                hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
                wthread <- forkIO (worker hworker)
@@ -332,7 +345,7 @@ main = hspec $
                stopBatchQueueing hworker ref
                threadDelay 30000
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1
+               batchSummaryQueued batch `shouldBe` 1
                batchSummaryStatus batch `shouldBe` BatchFinished
                killThread wthread
                destroy hworker
@@ -347,7 +360,7 @@ main = hspec $
                v <- takeMVar mvar
                v `shouldBe` 1000
                Just batch <- batchSummary hworker ref
-               batchSummaryTotal batch `shouldBe` 1000
+               batchSummaryQueued batch `shouldBe` 1000
                batchSummaryFailures batch `shouldBe` 0
                batchSummarySuccesses batch `shouldBe` 1000
                batchSummaryCompleted batch `shouldBe` 1000

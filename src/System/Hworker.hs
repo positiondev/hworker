@@ -175,14 +175,14 @@ decodeBatchStatus "finished"   = Just BatchFinished
 decodeBatchStatus _            = Nothing
 
 -- |  A summary of a particular batch, including figures on the total number
--- of jobs expected to be run, the number of jobs that have completed (i.e.
+-- of jobs queued, the number of jobs that have completed (i.e.
 -- failed or succeeded), the number of jobs succeeded, the number of jobs
 -- failed, the number of jobs retried, and the current status of the
 -- batch overall.
 data BatchSummary =
   BatchSummary
     { batchSummaryID        :: BatchId
-    , batchSummaryTotal     :: Int
+    , batchSummaryQueued    :: Int
     , batchSummaryCompleted :: Int
     , batchSummarySuccesses :: Int
     , batchSummaryFailures  :: Int
@@ -356,18 +356,29 @@ queueBatched hw j batch = do
 
       Right (Just status) | status == "queueing" -> do
         result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
-        void $ R.hincrby (batchCounter hw batch) "total" 1
+        void $ R.hincrby (batchCounter hw batch) "queued" 1
         return $ isRight result
 
       Right (Just _)-> do
         liftIO $ hwlog hw $ "Batch queuing completed, cannot enqueue further: " <> show batch
         return False
 
--- | Prevents queueing new jobs to a batch.
+-- | Prevents queueing new jobs to a batch. If the number of jobs completed equals
+-- the number of jobs queued, then the status of the batch is immediately set
+-- to `BatchFinished`, otherwise it's set to `BatchProcessing`.
 stopBatchQueueing :: Hworker s t -> BatchId -> IO ()
 stopBatchQueueing hw batch =
-  void . R.runRedis (hworkerConnection hw) $
-    R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
+  void . R.runRedis (hworkerConnection hw) $ do
+    r <- batchSummary' hw batch
+    case r of
+      Nothing ->
+        liftIO $ hwlog hw $ "Batch not found: " <> show batch
+
+      Just summary | batchSummaryCompleted summary >= batchSummaryQueued summary ->
+        void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchFinished)
+
+      Just _-> do
+        void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
 
 -- | Creates a new worker thread. This is blocking, so you will want to
 -- 'forkIO' this into a thread. You can have any number of these (and
@@ -424,9 +435,9 @@ worker hw =
                                      \  local batch = KEYS[2]\n\
                                      \  redis.call('hincrby', batch, 'successes', '1')\n\
                                      \  local completed = redis.call('hincrby', batch, 'completed', '1')\n\
-                                     \  local total = redis.call('hincrby', batch, 'total', '0')\n\
+                                     \  local queued = redis.call('hincrby', batch, 'queued', '0')\n\
                                      \  local status = redis.call('hget', batch, 'status')\n\
-                                     \  if tonumber(completed) >= tonumber(total) and status == 'processing' then\n\
+                                     \  if tonumber(completed) >= tonumber(queued) and status == 'processing' then\n\
                                      \    redis.call('hset', batch, 'status', 'finished')\n\
                                      \  end\n\
                                      \  return redis.call('hgetall', batch)\
@@ -498,9 +509,9 @@ worker hw =
                                      \  local batch = KEYS[3]\n\
                                      \  redis.call('hincrby', batch, 'failures', '1')\n\
                                      \  local completed = redis.call('hincrby', batch, 'completed', '1')\n\
-                                     \  local total = redis.call('hincrby', batch, 'total', '0')\n\
+                                     \  local queued = redis.call('hincrby', batch, 'queued', '0')\n\
                                      \  local status = redis.call('hget', batch, 'status')\n\
-                                     \  if tonumber(completed) >= tonumber(total) and status == 'processing' then\n\
+                                     \  if tonumber(completed) >= tonumber(queued) and status == 'processing' then\n\
                                      \    redis.call('hset', batch, 'status', 'finished')\n\
                                      \    return redis.call('hgetall', batch)\
                                      \  end\n\
@@ -620,7 +631,7 @@ initBatch hw seconds = do
   void . R.runRedis (hworkerConnection hw) $ do
     _ <-
       R.hmset (batchCounter hw batch)
-        [ ("total", "0")
+        [ ("queued", "0")
         , ("completed", "0")
         , ("successes", "0")
         , ("failures", "0")
@@ -632,17 +643,21 @@ initBatch hw seconds = do
 
 -- | Return a summary of the batch.
 batchSummary :: Hworker s t -> BatchId -> IO (Maybe BatchSummary)
-batchSummary hw batch = do
-  r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
+batchSummary hw batch =
+  R.runRedis (hworkerConnection hw) (batchSummary' hw batch)
+
+batchSummary' :: Hworker s t -> BatchId -> R.Redis (Maybe BatchSummary)
+batchSummary' hw batch = do
+  r <- R.hgetall (batchCounter hw batch)
   case r of
-    Left err -> hwlog hw err >> return Nothing
+    Left err -> liftIO (hwlog hw err) >> return Nothing
     Right hm -> return $ decodeBatchSummary batch hm
 
 decodeBatchSummary :: BatchId -> [(ByteString, ByteString)] -> Maybe BatchSummary
 decodeBatchSummary batch hm =
   BatchSummary
     <$> pure batch
-    <*> (lookup "total" hm >>= readMaybe)
+    <*> (lookup "queued" hm >>= readMaybe)
     <*> (lookup "completed" hm >>= readMaybe)
     <*> (lookup "successes" hm >>= readMaybe)
     <*> (lookup "failures" hm >>= readMaybe)
@@ -693,6 +708,11 @@ withList' hw a f =
        Right [] -> return ()
        Right xs -> f xs
 
+withInt' hw a =
+  do r <- a
+     case r of
+       Left err -> hwlog hw err >> return (-1)
+       Right n -> return n
 
 readMaybe :: Read a => ByteString -> Maybe a
 readMaybe =
