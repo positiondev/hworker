@@ -2,7 +2,6 @@
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE FunctionalDependencies     #-}
 {-# LANGUAGE GeneralisedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE RecordWildCards            #-}
@@ -66,6 +65,7 @@ module System.Hworker
          -- * Queuing Jobs
        , queue
        , queueBatched
+       , stopBatchQueueing
        , initBatch
          -- * Inspecting Workers
        , jobs
@@ -294,7 +294,7 @@ createWith HworkerConfig{..} =
 -- to do this in normal applications (and most likely, you won't want to).
 destroy :: Job s t => Hworker s t -> IO ()
 destroy hw = void $ R.runRedis (hworkerConnection hw) $ do
-               keys <- withList' hw (R.keys $ "hworker-batch-" <> hworkerName hw <> "*") (void . R.del)
+               withList' hw (R.keys $ "hworker-batch-" <> hworkerName hw <> "*") (void . R.del)
                R.del [ jobQueue hw
                      , progressQueue hw
                      , brokenQueue hw
@@ -324,14 +324,32 @@ queue hw j =
      isRight <$> R.runRedis (hworkerConnection hw)
                 (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id Nothing, j)])
 
-queueBatched :: Job s t => Hworker s t -> t -> BatchID -> Bool -> IO Bool
-queueBatched hw j batch finish = do
+queueBatched :: Job s t => Hworker s t -> t -> BatchID -> IO Bool
+queueBatched hw j batch = do
   job_id <- UUID.toText <$> UUID.nextRandom
   R.runRedis (hworkerConnection hw) $ do
-    result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
-    void $ R.hincrby (batchCounter hw batch) "total" 1
-    when finish . void $ R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
-    return $ isRight result
+    s <- R.hget (batchCounter hw batch) "status"
+    case s of
+      Left err ->
+        liftIO (hwlog hw err) >> return False
+
+      Right Nothing -> do
+        liftIO $ hwlog hw $ "Batch not found: " <> show batch
+        return False
+
+      Right (Just status) | status == "queueing" -> do
+        result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id (Just batch), j)]
+        void $ R.hincrby (batchCounter hw batch) "total" 1
+        return $ isRight result
+
+      Right (Just _)-> do
+        liftIO $ hwlog hw $ "Batch queuing completed, cannot enqueue further: " <> show batch
+        return False
+
+stopBatchQueueing :: Hworker s t -> BatchID -> IO ()
+stopBatchQueueing hw batch =
+  void . R.runRedis (hworkerConnection hw) $
+    R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
 
 -- | Creates a new worker thread. This is blocking, so you will want to
 -- 'forkIO' this into a thread. You can have any number of these (and
@@ -473,8 +491,8 @@ worker hw =
                                      [progressQueue hw, failedQueue hw, batchCounter hw batch]
                                      [t, B8.pack (show (hworkerFailedQueueSize hw - 1))]
                              )
-                             (\r ->
-                                case decodeBatchSummary batch r of
+                             (\s ->
+                                case decodeBatchSummary batch s of
                                   Nothing -> return ()
                                   Just summary -> hworkerBatchCompleted hw summary
                              )
