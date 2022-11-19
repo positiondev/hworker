@@ -52,7 +52,7 @@ module System.Hworker
        , ExceptionBehavior(..)
        , RedisConnection(..)
        , defaultHworkerConfig
-       , BatchID(..)
+       , BatchId(..)
        , BatchStatus(..)
        , BatchSummary(..)
          -- * Managing Workers
@@ -65,8 +65,8 @@ module System.Hworker
          -- * Queuing Jobs
        , queue
        , queueBatched
-       , stopBatchQueueing
        , initBatch
+       , stopBatchQueueing
          -- * Inspecting Workers
        , jobs
        , failed
@@ -91,7 +91,8 @@ import           Data.ByteString         (ByteString)
 import qualified Data.ByteString.Char8   as B8
 import qualified Data.ByteString.Lazy    as LB
 import           Data.Either             (isRight)
-import           Data.Maybe              (fromJust, isJust, mapMaybe, listToMaybe)
+import           Data.Maybe              (fromJust, fromMaybe, isJust, mapMaybe,
+                                          listToMaybe)
 import           Data.Monoid             ((<>))
 import           Data.Text               (Text)
 import qualified Data.Text               as T
@@ -148,42 +149,56 @@ data JobData t = JobData UTCTime t
 -- intermittent problems).
 data ExceptionBehavior = RetryOnException | FailOnException
 
-type JobID = Text
+type JobId = Text
 
 -- | A unique identifier for grouping jobs together.
-newtype BatchID = BatchID UUID deriving (ToJSON, FromJSON, Eq, Show)
+newtype BatchId = BatchId UUID deriving (ToJSON, FromJSON, Eq, Show)
 
-data BatchStatus = BatchQueuing | BatchProcessing | BatchFinished
+-- | Represents the current status of a batch. A batch is considered to be
+-- "queueing" if jobs can still be added to the batch. While jobs are
+-- queueing it is possible for them to be "processing" during that time.
+-- The status only changes to "processing" once jobs can no longer be queued
+-- but are still being processed. The batch is then finished once all jobs
+-- are processed (they have either failed or succeeded).
+data BatchStatus = BatchQueueing | BatchProcessing | BatchFinished
   deriving (Eq, Show)
 
 encodeBatchStatus :: BatchStatus -> ByteString
-encodeBatchStatus BatchQueuing    = "queueing"
+encodeBatchStatus BatchQueueing   = "queueing"
 encodeBatchStatus BatchProcessing = "processing"
 encodeBatchStatus BatchFinished   = "finished"
 
 decodeBatchStatus :: ByteString -> Maybe BatchStatus
-decodeBatchStatus "queueing"   = Just BatchQueuing
+decodeBatchStatus "queueing"   = Just BatchQueueing
 decodeBatchStatus "processing" = Just BatchProcessing
 decodeBatchStatus "finished"   = Just BatchFinished
 decodeBatchStatus _            = Nothing
 
+-- |  A summary of a particular batch, including figures on the total number
+-- of jobs expected to be run, the number of jobs that have completed (i.e.
+-- failed or succeeded), the number of jobs succeeded, the number of jobs
+-- failed, the number of jobs retried, and the current status of the
+-- batch overall.
 data BatchSummary =
   BatchSummary
-    { batchSummaryID        :: BatchID
+    { batchSummaryID        :: BatchId
     , batchSummaryTotal     :: Int
     , batchSummaryCompleted :: Int
     , batchSummarySuccesses :: Int
     , batchSummaryFailures  :: Int
     , batchSummaryRetries   :: Int
     , batchSummaryStatus    :: BatchStatus
-    } deriving Show
+    } deriving (Eq, Show)
 
-data JobRef = JobRef JobID (Maybe BatchID) deriving (Eq, Show)
+data JobRef = JobRef JobId (Maybe BatchId) deriving (Eq, Show)
 
 instance ToJSON JobRef where
   toJSON (JobRef j b) = A.object ["j" .= j, "b" .= b]
 
 instance FromJSON JobRef where
+  -- NOTE(rjbf 2022-11-19): This is just here for the sake of migration and
+  -- can be removed eventually. Before `JobRef`, which is encoded as
+  -- a JSON object, there was a just a `String` representing the job ID.
   parseJSON (A.String j) = pure (JobRef j Nothing)
   parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b") val
 
@@ -313,8 +328,8 @@ brokenQueue hw = "hworker-broken-" <> hworkerName hw
 failedQueue :: Hworker s t -> ByteString
 failedQueue hw = "hworker-failed-" <> hworkerName hw
 
-batchCounter :: Hworker s t -> BatchID -> ByteString
-batchCounter hw (BatchID batch) =
+batchCounter :: Hworker s t -> BatchId -> ByteString
+batchCounter hw (BatchId batch) =
   "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
 
 -- | Adds a job to the queue. Returns whether the operation succeeded.
@@ -324,7 +339,9 @@ queue hw j =
      isRight <$> R.runRedis (hworkerConnection hw)
                 (R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef job_id Nothing, j)])
 
-queueBatched :: Job s t => Hworker s t -> t -> BatchID -> IO Bool
+-- | Adds a job to the queue, but as part of a particular batch of jobs.
+-- Returns whether the operation succeeded.
+queueBatched :: Job s t => Hworker s t -> t -> BatchId -> IO Bool
 queueBatched hw j batch = do
   job_id <- UUID.toText <$> UUID.nextRandom
   R.runRedis (hworkerConnection hw) $ do
@@ -346,7 +363,8 @@ queueBatched hw j batch = do
         liftIO $ hwlog hw $ "Batch queuing completed, cannot enqueue further: " <> show batch
         return False
 
-stopBatchQueueing :: Hworker s t -> BatchID -> IO ()
+-- | Prevents queueing new jobs to a batch.
+stopBatchQueueing :: Hworker s t -> BatchId -> IO ()
 stopBatchQueueing hw batch =
   void . R.runRedis (hworkerConnection hw) $
     R.hset (batchCounter hw batch) "status" (encodeBatchStatus BatchProcessing)
@@ -593,28 +611,34 @@ debugger microseconds hw =
                         (\queued -> hwlog hw ("DEBUG", queued, running)))
      threadDelay microseconds
 
-initBatch :: Hworker s t -> IO BatchID
-initBatch hw = do
-  batch <- BatchID <$> UUID.nextRandom
-  R.runRedis (hworkerConnection hw) $
-    R.hmset (batchCounter hw batch)
-      [ ("total", "0")
-      , ("completed", "0")
-      , ("successes", "0")
-      , ("failures", "0")
-      , ("retries", "0")
-      , ("status", "queueing")
-      ]
+-- | Initializes a batch of jobs. By default the information for tracking a
+-- batch of jobs, created by this function, will expires a week from
+-- its creation. The optional `seconds` argument can be used to override this.
+initBatch :: Hworker s t -> Maybe Integer -> IO BatchId
+initBatch hw seconds = do
+  batch <- BatchId <$> UUID.nextRandom
+  void . R.runRedis (hworkerConnection hw) $ do
+    _ <-
+      R.hmset (batchCounter hw batch)
+        [ ("total", "0")
+        , ("completed", "0")
+        , ("successes", "0")
+        , ("failures", "0")
+        , ("retries", "0")
+        , ("status", "queueing")
+        ]
+    R.expire (batchCounter hw batch) (fromMaybe 604800 seconds)
   return batch
 
-batchSummary :: Hworker s t -> BatchID -> IO (Maybe BatchSummary)
+-- | Return a summary of the batch.
+batchSummary :: Hworker s t -> BatchId -> IO (Maybe BatchSummary)
 batchSummary hw batch = do
   r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
   case r of
     Left err -> hwlog hw err >> return Nothing
     Right hm -> return $ decodeBatchSummary batch hm
 
-decodeBatchSummary :: BatchID -> [(ByteString, ByteString)] -> Maybe BatchSummary
+decodeBatchSummary :: BatchId -> [(ByteString, ByteString)] -> Maybe BatchSummary
 decodeBatchSummary batch hm =
   BatchSummary
     <$> pure batch
