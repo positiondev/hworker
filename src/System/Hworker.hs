@@ -55,7 +55,7 @@ module System.Hworker
        , defaultHworkerConfig
        , BatchID(..)
        , BatchStatus(..)
-       , BatchJob(..)
+       , BatchSummary(..)
          -- * Managing Workers
        , create
        , createWith
@@ -167,15 +167,15 @@ decodeBatchStatus "processing" = Just BatchProcessing
 decodeBatchStatus "finished"   = Just BatchFinished
 decodeBatchStatus _            = Nothing
 
-data BatchJob =
-  BatchJob
-    { batchID        :: BatchID
-    , batchTotal     :: Int
-    , batchCompleted :: Int
-    , batchSuccesses :: Int
-    , batchFailures  :: Int
-    , batchRetries   :: Int
-    , batchStatus    :: BatchStatus
+data BatchSummary =
+  BatchSummary
+    { batchSummaryID        :: BatchID
+    , batchSummaryTotal     :: Int
+    , batchSummaryCompleted :: Int
+    , batchSummarySuccesses :: Int
+    , batchSummaryFailures  :: Int
+    , batchSummaryRetries   :: Int
+    , batchSummaryStatus    :: BatchStatus
     } deriving Show
 
 data JobRef = JobRef JobID (Maybe BatchID) deriving (Eq, Show)
@@ -201,7 +201,7 @@ data Hworker s t =
              , hworkerJobTimeout        :: NominalDiffTime
              , hworkerFailedQueueSize   :: Int
              , hworkerDebug             :: Bool
-             , hworkerBatchCompleted    :: BatchJob -> IO ()
+             , hworkerBatchCompleted    :: BatchSummary -> IO ()
              }
 
 -- | When configuring a worker, you can tell it to use an existing
@@ -406,7 +406,7 @@ worker hw =
                                      delayAndRun
 
                                    Just summary -> do
-                                     when (batchStatus summary == BatchFinished)
+                                     when (batchSummaryStatus summary == BatchFinished)
                                        $ hworkerBatchCompleted hw summary
                                      justRun
                              )
@@ -591,16 +591,16 @@ initBatch hw = do
       ]
   return batch
 
-batchJob :: Hworker s t -> BatchID -> IO (Maybe BatchJob)
+batchJob :: Hworker s t -> BatchID -> IO (Maybe BatchSummary)
 batchJob hw batch = do
   r <- R.runRedis (hworkerConnection hw) (R.hgetall (batchCounter hw batch))
   case r of
     Left err -> hwlog hw err >> return Nothing
     Right hm -> return $ decodeBatchSummary batch hm
 
-decodeBatchSummary :: BatchID -> [(ByteString, ByteString)] -> Maybe BatchJob
+decodeBatchSummary :: BatchID -> [(ByteString, ByteString)] -> Maybe BatchSummary
 decodeBatchSummary batch hm =
-  BatchJob
+  BatchSummary
     <$> pure batch
     <*> (lookup "total" hm >>= readMaybe)
     <*> (lookup "completed" hm >>= readMaybe)
