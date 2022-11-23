@@ -625,11 +625,11 @@ debugger microseconds hw =
 -- | Initializes a batch of jobs. By default the information for tracking a
 -- batch of jobs, created by this function, will expires a week from
 -- its creation. The optional `seconds` argument can be used to override this.
-initBatch :: Hworker s t -> Maybe Integer -> IO BatchId
-initBatch hw seconds = do
+initBatch :: Hworker s t -> Maybe Integer -> IO (Maybe BatchId)
+initBatch hw mseconds = do
   batch <- BatchId <$> UUID.nextRandom
-  void . R.runRedis (hworkerConnection hw) $ do
-    _ <-
+  R.runRedis (hworkerConnection hw) $ do
+    r <-
       R.hmset (batchCounter hw batch)
         [ ("queued", "0")
         , ("completed", "0")
@@ -638,8 +638,15 @@ initBatch hw seconds = do
         , ("retries", "0")
         , ("status", "queueing")
         ]
-    R.expire (batchCounter hw batch) (fromMaybe 604800 seconds)
-  return batch
+    case r of
+      Left err ->
+        liftIO (hwlog hw err) >> return Nothing
+
+      Right _ -> do
+        case mseconds of
+          Nothing -> return ()
+          Just s  -> void $ R.expire (batchCounter hw batch) s
+        return (Just batch)
 
 -- | Return a summary of the batch.
 batchSummary :: Hworker s t -> BatchId -> IO (Maybe BatchSummary)
