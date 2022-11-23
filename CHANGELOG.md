@@ -1,3 +1,7 @@
+* 0.3.0 Remeike Forbes 2022-11-23
+
+  Introduce batched jobs
+
 * 0.2.0 Remeike Forbes
 
   Coerce jobs to string (to work with Redis 5)

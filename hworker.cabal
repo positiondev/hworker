@@ -1,5 +1,5 @@
 name:                hworker
-version:             0.2.0
+version:             0.3.0
 synopsis:            A reliable at-least-once job queue built on top of redis.
 description:         See README.
 homepage:            http://github.com/positiondev/hworker
@@ -22,6 +22,7 @@ library
                      , time >= 1.5
                      , attoparsec
                      , uuid >= 1.2.6
+                     , mtl
   hs-source-dirs:      src
   default-language:    Haskell2010
   ghc-options:         -Wall
@@ -43,3 +44,4 @@ Test-Suite hworker-test
                      , hspec >= 2
                      , hspec-contrib
                      , HUnit
+                     , mtl
