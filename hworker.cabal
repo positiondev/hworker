@@ -1,5 +1,5 @@
 name:                hworker
-version:             0.2.0
+version:             0.3.0
 synopsis:            A reliable at-least-once job queue built on top of redis.
 description:         See README.
 homepage:            http://github.com/positiondev/hworker
