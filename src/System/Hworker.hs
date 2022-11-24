@@ -88,7 +88,6 @@ import           Control.Monad           ( forM_, forever, void, when )
 import           Control.Monad.Trans     ( liftIO )
 import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:) )
 import qualified Data.Aeson             as A
-import           Data.Aeson.Helpers      ( decodeValue )
 import           Data.ByteString         ( ByteString )
 import qualified Data.ByteString.Char8  as B8
 import qualified Data.ByteString.Lazy   as LB
@@ -539,7 +538,7 @@ worker hw =
     Right (Just t) -> do
       when (hworkerDebug hw) $  hwlog hw ("WORKER RUNNING" :: Text, t)
 
-      case decodeValue (LB.fromStrict t) of
+      case A.decodeStrict t of
         Nothing -> do
           hwlog hw ("BROKEN JOB" :: Text, t)
           now' <- getCurrentTime
@@ -752,8 +751,7 @@ jobsFromQueue hw q =
         return []
 
       Right xs ->
-        return
-          $ mapMaybe (fmap (\(JobRef _ _, x) -> x) . decodeValue . LB.fromStrict) xs
+        return $ mapMaybe (fmap (\(JobRef _ _, x) -> x) . A.decodeStrict) xs
 
 
 -- | Returns all pending jobs.
@@ -897,7 +895,7 @@ decodeBatchSummary batch hm =
 
 parseTime :: ByteString -> UTCTime
 parseTime t =
-  case decodeValue (LB.fromStrict t) of
+  case A.decodeStrict t of
     Nothing   -> error ("FAILED TO PARSE TIMESTAMP: " <> B8.unpack t)
     Just time -> time
 
