@@ -7,6 +7,7 @@
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StrictData                 #-}
 
 {-|
 
@@ -50,9 +51,9 @@ module System.Hworker
   , Job(..)
   , Hworker
   , HworkerConfig(..)
+  , defaultHworkerConfig
   , ExceptionBehavior(..)
   , RedisConnection(..)
-  , defaultHworkerConfig
   , BatchId(..)
   , BatchStatus(..)
   , BatchSummary(..)
@@ -142,7 +143,7 @@ instance FromJSON Result
 -- structure. The data structure (the `t` parameter) will be stored
 -- and copied a few times in Redis while in the lifecycle, so
 -- generally it is a good idea for it to be relatively small (and have
--- it be able to look up data that it needs while the job in running).
+-- it be able to look up data that it needs while the job is running).
 --
 -- Finally, while deriving FromJSON and ToJSON instances automatically
 -- might seem like a good idea, you will most likely be better off
@@ -150,7 +151,7 @@ instance FromJSON Result
 -- compatible if you change them, as any jobs that can't be
 -- deserialized will not be run (and will end up in the 'broken'
 -- queue). This will only happen if the queue is non-empty when you
--- replce the running application version, but this is obviously
+-- replace the running application version, but this is obviously
 -- possible and could be likely depending on your use.
 
 class (FromJSON t, ToJSON t, Show t) => Job s t | s -> t where
