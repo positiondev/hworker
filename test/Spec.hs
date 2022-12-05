@@ -9,10 +9,24 @@ import           Control.Concurrent       ( forkIO, killThread, threadDelay )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
                                           , readMVar, takeMVar
                                           )
-import           Control.Monad            ( replicateM_ )
-import           Data.Aeson               ( FromJSON, ToJSON )
+import           Control.Monad            ( replicateM_, void )
+import           Control.Monad.Trans      ( lift, liftIO )
+import           Data.Aeson               ( FromJSON(..), ToJSON(..) )
+import           Data.ByteString          ( ByteString )
+import           Data.Conduit             ( ConduitT, (.|) )
+import qualified Data.Conduit            as Conduit
 import           Data.Text                ( Text )
 import qualified Data.Text               as T
+import           Database.Redis           ( Redis
+                                          , RedisTx
+                                          , TxResult(..)
+                                          , Connection
+                                          , ConnectInfo
+                                          , Queued
+                                          , Reply
+                                          , runRedis
+                                          )
+import qualified Database.Redis          as Redis
 import           GHC.Generics             ( Generic)
 import           System.IO                ( stdout, hFlush )
 import           Test.Hspec
@@ -163,7 +177,7 @@ main = hspec $ do
     it "should set up a batch job" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      summary <- startBatch hworker Nothing >>=   expectBatchSummary hworker
+      summary <- startBatch hworker Nothing >>= expectBatchSummary hworker
       batchSummaryQueued summary `shouldBe` 0
       batchSummaryCompleted summary `shouldBe` 0
       batchSummarySuccesses summary `shouldBe` 0
@@ -185,7 +199,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
       destroy hworker
@@ -195,10 +209,10 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
-      queueBatched hworker SimpleJob batch >>= shouldBe False
+      queueBatch hworker batch False [SimpleJob] >>= shouldBe False
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -210,7 +224,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -226,7 +240,7 @@ main = hspec $ do
       hworker <- createWith (conf "failworker-1" (FailState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker FailJob batch
+      queueBatch hworker batch False [FailJob]
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -241,7 +255,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       stopBatchQueueing hworker batch
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -253,7 +267,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
       Just batch <- batchSummary hworker batch
@@ -267,7 +281,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       stopBatchQueueing hworker batch
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
@@ -281,7 +295,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-3" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      replicateM_ 1000 (queueBatched hworker SimpleJob batch)
+      queueBatch hworker batch False (replicate 1000 SimpleJob)
       stopBatchQueueing hworker batch
       threadDelay 2000000
       v <- takeMVar mvar
@@ -294,6 +308,80 @@ main = hspec $ do
       batchSummaryStatus summary `shouldBe` BatchFinished
       killThread wthread
       destroy hworker
+
+    describe "Atomicity Tests" $ do
+      it "should queue all jobs" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True
+          $ replicateM_ 50
+          $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        length ls `shouldBe` 50
+        summary <- expectBatchSummary hworker batch
+        batchSummaryQueued summary `shouldBe` 50
+        batchSummaryStatus summary `shouldBe` BatchProcessing
+        destroy hworker
+
+      it "should not queue jobs when producer throws error" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True $ do
+          replicateM_ 20 $ Conduit.yield SimpleJob
+          error "BLOW UP!"
+          replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should not queue jobs on transaction error" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True $ do
+          replicateM_ 20 $ Conduit.yield SimpleJob
+          _ <- lift $ Redis.lpush "" []
+          replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should not queue jobs when transaction is aborted" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        _ <- runRedis (hworkerConnection hworker) $ Redis.watch [batchCounter hworker batch]
+        streamBatch hworker batch True $ replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should increment summary but then reset after failure" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+
+        thread <-
+          forkIO . void . streamBatch hworker batch True $ do
+            replicateM_ 5 $
+              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+            error "BLOW UP!"
+            replicateM_ 5 $
+              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+
+        threadDelay 190000
+        summary1 <- expectBatchSummary hworker batch
+        batchSummaryQueued summary1 `shouldBe` 4
+        ls <- jobs hworker
+        length ls `shouldBe` 0
+        threadDelay 100000
+        summary2 <- expectBatchSummary hworker batch
+        batchSummaryQueued summary2 `shouldBe` 0
+        killThread thread
+        destroy hworker
+
 
   describe "Monitor" $ do
     it "should add job back after timeout" $ do
@@ -321,8 +409,10 @@ main = hspec $ do
       killThread wthread1
       wthread2 <- forkIO (worker hworker)
       threadDelay 10000000
-      destroy hworker
       v <- takeMVar mvar
+      killThread wthread2
+      killThread mthread
+      destroy hworker
       assertEqual "State should be 1, since first failed" 1 v
 
     it "should add back multiple jobs after timeout" $ do
@@ -345,6 +435,8 @@ main = hspec $ do
       threadDelay 10000000
       destroy hworker
       v <- takeMVar mvar
+      killThread wthread3
+      killThread mthread
       assertEqual "State should be 2, since first 2 failed" 2 v
 
     it "should work with multiple monitors" $ do
@@ -371,6 +463,8 @@ main = hspec $ do
       threadDelay 30000000
       destroy hworker
       v <- takeMVar mvar
+      killThread wthread3
+      mapM_ killThread [mthread1, mthread2, mthread3, mthread4, mthread5, mthread6]
       assertEqual "State should be 2, since first 2 failed" 2 v
       -- NOTE(dbp 2015-07-24): It would be really great to have a
       -- test that went after a race between the retry logic and

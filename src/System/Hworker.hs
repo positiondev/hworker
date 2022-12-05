@@ -49,7 +49,7 @@ module System.Hworker
   ( -- * Types
     Result(..)
   , Job(..)
-  , Hworker
+  , Hworker(..)
   , HworkerConfig(..)
   , defaultHworkerConfig
   , ExceptionBehavior(..)
@@ -66,7 +66,8 @@ module System.Hworker
   , monitor
     -- * Queuing Jobs
   , queue
-  , queueBatched
+  , queueBatch
+  , streamBatch
   , initBatch
   , stopBatchQueueing
     -- * Inspecting Workers
@@ -75,23 +76,27 @@ module System.Hworker
   , broken
     -- * Debugging Utilities
   , debugger
+  , batchCounter
   ) where
 
 --------------------------------------------------------------------------------
 import           Control.Arrow           ( second)
 import           Control.Concurrent      ( threadDelay)
 import           Control.Exception       ( SomeException
+                                         , catch
                                          , catchJust
                                          , asyncExceptionFromException
                                          , AsyncException
                                          )
 import           Control.Monad           ( forM_, forever, void, when )
-import           Control.Monad.Trans     ( liftIO )
+import           Control.Monad.Trans     ( liftIO, lift )
 import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:) )
 import qualified Data.Aeson             as A
 import           Data.ByteString         ( ByteString )
 import qualified Data.ByteString.Char8  as B8
 import qualified Data.ByteString.Lazy   as LB
+import           Data.Conduit            ( ConduitT, (.|) )
+import qualified Data.Conduit           as Conduit
 import           Data.Either             ( isRight )
 import           Data.Maybe              ( isJust, mapMaybe, listToMaybe )
 import           Data.Text               ( Text )
@@ -106,6 +111,8 @@ import           Data.UUID               ( UUID )
 import qualified Data.UUID              as UUID
 import qualified Data.UUID.V4           as UUID
 import           Database.Redis          ( Redis
+                                         , RedisTx
+                                         , TxResult(..)
                                          , Connection
                                          , ConnectInfo
                                          , runRedis
@@ -415,40 +422,112 @@ queue hw j = do
   return $ isRight result
 
 
--- | Adds a job to the queue, but as part of a particular batch of jobs.
--- Returns whether the operation succeeded.
+-- | Adds jobs to the queue, but as part of a particular batch of jobs.
+-- It takes the `BatchId` of the specified job, a `Bool` that when `True`
+-- closes the batch to further queueing, and a list of jobs to be queued, and
+-- returns whether the operation succeeded. The process is atomic
+-- so that if a single job fails to queue then then none of the jobs
+-- in the list will queue.
 
-queueBatched :: Job s t => Hworker s t -> t -> BatchId -> IO Bool
-queueBatched hw j batch = do
-  jobId <- UUID.toText <$> UUID.nextRandom
-  runRedis (hworkerConnection hw) $
-    R.hget (batchCounter hw batch) "status" >>=
-      \case
-        Left err -> do
-          liftIO (hwlog hw err)
-          return False
+queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO Bool
+queueBatch hw batch close js  =
+  withBatchQueue hw batch $ runRedis (hworkerConnection hw) $
+    R.multiExec $ do
+      mapM_
+        ( \j -> do
+            jobId <- UUID.toText <$> liftIO UUID.nextRandom
+            let ref = JobRef jobId (Just batch)
+            _ <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
 
-        Right Nothing -> do
-          liftIO $ hwlog hw $ "BATCH NOT FOUND: " <> show batch
-          return False
+            -- Do the counting outside of the transaction, hence runRedis here.
+            liftIO
+              $ runRedis (hworkerConnection hw)
+              $ R.hincrby (batchCounter hw batch) "queued" 1
+        )
+        js
 
-        Right (Just status) | status == "queueing" ->
-          let
-            ref =
-              JobRef jobId (Just batch)
-          in do
-          result <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
-          _      <- R.hincrby (batchCounter hw batch) "queued" 1
-          return $ isRight result
+      when close
+        $ void
+        $ R.hset (batchCounter hw batch) "status" "processing"
 
-        Right (Just _)-> do
-          liftIO $ hwlog hw $
-            mconcat
-              [ "QUEUEING COMPLETED FOR BATCH: "
-              , show batch
-              , ". CANNOT ENQUEUE NEW JOBS."
-              ]
-          return False
+      return (pure ())
+
+
+-- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
+-- that streams jobs in.
+
+streamBatch ::
+  Job s t =>
+  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx () -> IO Bool
+streamBatch hw batch close producer =
+  let
+    sink =
+      Conduit.await >>=
+        \case
+          Nothing -> do
+            when close
+              $ void . lift
+              $ R.hset (batchCounter hw batch) "status" "processing"
+            return (pure ())
+
+          Just j -> do
+            jobId <- UUID.toText <$> liftIO UUID.nextRandom
+            let ref = JobRef jobId (Just batch)
+            _ <- lift $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
+
+            -- Do the counting outside of the transaction, hence runRedis here.
+            _ <-
+              liftIO
+                $ runRedis (hworkerConnection hw)
+                $ R.hincrby (batchCounter hw batch) "queued" 1
+
+            sink
+  in
+  withBatchQueue hw batch
+    $ runRedis (hworkerConnection hw)
+    $ R.multiExec (Conduit.runConduit (producer .| sink))
+
+
+withBatchQueue ::
+  Job s t => Hworker s t -> BatchId -> IO (TxResult ()) -> IO Bool
+withBatchQueue hw batch process =
+  runRedis (hworkerConnection hw) (batchSummary' hw batch) >>=
+    \case
+      Nothing -> do
+        hwlog hw $ "BATCH NOT FOUND: " <> show batch
+        return False
+
+      Just summary | batchSummaryStatus summary == BatchQueueing ->
+        catch
+          ( process >>=
+              \case
+                TxSuccess () ->
+                  return True
+
+                TxAborted -> do
+                  hwlog hw ("TRANSACTION ABORTED" :: String)
+                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
+                  return False
+
+                TxError err -> do
+                  hwlog hw err
+                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
+                  return False
+          )
+          ( \(e :: SomeException) -> do
+              hwlog hw $ show e
+              runRedis (hworkerConnection hw) (resetBatchSummary hw summary)
+              return False
+          )
+
+      Just _-> do
+        hwlog hw $
+          mconcat
+            [ "QUEUEING COMPLETED FOR BATCH: "
+            , show batch
+            , ". CANNOT ENQUEUE NEW JOBS."
+            ]
+        return False
 
 
 -- | Prevents queueing new jobs to a batch. If the number of jobs completed equals
@@ -904,3 +983,20 @@ parseTime t =
 readMaybe :: Read a => ByteString -> Maybe a
 readMaybe =
   fmap fst . listToMaybe . reads . B8.unpack
+
+
+resetBatchSummary :: R.RedisCtx m n => Hworker s t -> BatchSummary -> m ()
+resetBatchSummary hw BatchSummary{..} =
+  let
+    encode =
+      B8.pack . show
+  in
+  void $
+    R.hmset (batchCounter hw batchSummaryID)
+      [ ("queued", encode batchSummaryQueued)
+      , ("completed", encode batchSummaryCompleted)
+      , ("successes", encode batchSummarySuccesses)
+      , ("failures", encode batchSummaryFailures)
+      , ("retries", encode batchSummaryRetries)
+      , ("status", encodeBatchStatus batchSummaryStatus)
+      ]
