@@ -32,6 +32,8 @@ Test-Suite hworker-test
   hs-source-dirs:      src test
   main-is:             Spec.hs
   other-modules:       System.Hworker
+  ghc-options:         -Wall
+                       -fno-warn-unused-do-bind
   build-depends:       base >= 4.7 && < 5
                      , aeson
                      , hedis >= 0.6.5

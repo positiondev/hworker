@@ -95,7 +95,7 @@ import qualified Data.Aeson             as A
 import           Data.ByteString         ( ByteString )
 import qualified Data.ByteString.Char8  as B8
 import qualified Data.ByteString.Lazy   as LB
-import           Data.Conduit            ( ConduitT, (.|) )
+import           Data.Conduit            ( ConduitT )
 import qualified Data.Conduit           as Conduit
 import           Data.Either             ( isRight )
 import           Data.Maybe              ( isJust, mapMaybe, listToMaybe )
@@ -430,7 +430,7 @@ queue hw j = do
 -- in the list will queue.
 
 queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO Bool
-queueBatch hw batch close js  =
+queueBatch hw batch close js =
   withBatchQueue hw batch $ runRedis (hworkerConnection hw) $
     R.multiExec $ do
       mapM_
@@ -485,7 +485,7 @@ streamBatch hw batch close producer =
   in
   withBatchQueue hw batch
     $ runRedis (hworkerConnection hw)
-    $ R.multiExec (Conduit.runConduit (producer .| sink))
+    $ R.multiExec (Conduit.connect producer sink)
 
 
 withBatchQueue ::
