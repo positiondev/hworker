@@ -9,12 +9,14 @@ import           Control.Concurrent       ( forkIO, killThread, threadDelay )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
                                           , readMVar, takeMVar
                                           )
-import           Control.Monad            ( replicateM_ )
-import           Data.Aeson               ( FromJSON, ToJSON )
+import           Control.Monad            ( replicateM_, void )
+import           Control.Monad.Trans      ( lift, liftIO )
+import           Data.Aeson               ( FromJSON(..), ToJSON(..) )
+import qualified Data.Conduit            as Conduit
 import           Data.Text                ( Text )
 import qualified Data.Text               as T
+import qualified Database.Redis          as Redis
 import           GHC.Generics             ( Generic)
-import           System.IO                ( stdout, hFlush )
 import           Test.Hspec
 import           Test.HUnit               ( assertEqual )
 --------------------------------------------------------------------------------
@@ -136,9 +138,9 @@ main = hspec $ do
       queue hworker FailJob
       threadDelay 30000
       killThread wthread
-      jobs <- failed hworker
+      failedJobs <- failed hworker
       destroy hworker
-      assertEqual "Should have failed job" [FailJob] jobs
+      assertEqual "Should have failed job" [FailJob] failedJobs
 
     it "should only store failedQueueSize failed jobs" $ do
       mvar <- newMVar 0
@@ -153,17 +155,17 @@ main = hspec $ do
       queue hworker AlwaysFailJob
       threadDelay 100000
       killThread wthread
-      jobs <- failed hworker
+      failedJobs <- failed hworker
       destroy hworker
       v <- takeMVar mvar
       assertEqual "State should be 4, since all jobs were run" 4 v
-      assertEqual "Should only have stored 2" [AlwaysFailJob,AlwaysFailJob] jobs
+      assertEqual "Should only have stored 2" [AlwaysFailJob,AlwaysFailJob] failedJobs
 
   describe "Batch" $ do
     it "should set up a batch job" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
-      summary <- startBatch hworker Nothing >>=   expectBatchSummary hworker
+      summary <- startBatch hworker Nothing >>= expectBatchSummary hworker
       batchSummaryQueued summary `shouldBe` 0
       batchSummaryCompleted summary `shouldBe` 0
       batchSummarySuccesses summary `shouldBe` 0
@@ -185,7 +187,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
       destroy hworker
@@ -195,10 +197,10 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
-      queueBatched hworker SimpleJob batch >>= shouldBe False
+      queueBatch hworker batch False [SimpleJob] >>= shouldBe False
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -210,7 +212,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -226,7 +228,7 @@ main = hspec $ do
       hworker <- createWith (conf "failworker-1" (FailState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker FailJob batch
+      queueBatch hworker batch False [FailJob]
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -241,7 +243,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       stopBatchQueueing hworker batch
       summary <- expectBatchSummary hworker batch
       batchSummaryQueued summary `shouldBe` 1
@@ -253,12 +255,12 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
-      Just batch <- batchSummary hworker batch
-      batchSummaryQueued batch `shouldBe` 1
-      batchSummaryStatus batch `shouldBe` BatchFinished
+      Just batch' <- batchSummary hworker batch
+      batchSummaryQueued batch' `shouldBe` 1
+      batchSummaryStatus batch' `shouldBe` BatchFinished
       killThread wthread
       destroy hworker
 
@@ -267,7 +269,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      queueBatched hworker SimpleJob batch
+      queueBatch hworker batch False [SimpleJob]
       stopBatchQueueing hworker batch
       threadDelay 30000
       summary <- expectBatchSummary hworker batch
@@ -281,7 +283,7 @@ main = hspec $ do
       hworker <- createWith (conf "simpleworker-3" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
       batch <- startBatch hworker Nothing
-      replicateM_ 1000 (queueBatched hworker SimpleJob batch)
+      queueBatch hworker batch False (replicate 1000 SimpleJob)
       stopBatchQueueing hworker batch
       threadDelay 2000000
       v <- takeMVar mvar
@@ -294,6 +296,80 @@ main = hspec $ do
       batchSummaryStatus summary `shouldBe` BatchFinished
       killThread wthread
       destroy hworker
+
+    describe "Atomicity Tests" $ do
+      it "should queue all jobs" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True
+          $ replicateM_ 50
+          $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        length ls `shouldBe` 50
+        summary <- expectBatchSummary hworker batch
+        batchSummaryQueued summary `shouldBe` 50
+        batchSummaryStatus summary `shouldBe` BatchProcessing
+        destroy hworker
+
+      it "should not queue jobs when producer throws error" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True $ do
+          replicateM_ 20 $ Conduit.yield SimpleJob
+          error "BLOW UP!"
+          replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should not queue jobs on transaction error" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        streamBatch hworker batch True $ do
+          replicateM_ 20 $ Conduit.yield SimpleJob
+          _ <- lift $ Redis.lpush "" []
+          replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should not queue jobs when transaction is aborted" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+        _ <- Redis.runRedis (hworkerConnection hworker) $ Redis.watch [batchCounter hworker batch]
+        streamBatch hworker batch True $ replicateM_ 20 $ Conduit.yield SimpleJob
+        ls <- jobs hworker
+        destroy hworker
+        length ls `shouldBe` 0
+
+      it "should increment summary but then reset after failure" $ do
+        mvar <- newMVar 0
+        hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+        batch <- startBatch hworker Nothing
+
+        thread <-
+          forkIO . void . streamBatch hworker batch True $ do
+            replicateM_ 5 $
+              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+            error "BLOW UP!"
+            replicateM_ 5 $
+              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+
+        threadDelay 190000
+        summary1 <- expectBatchSummary hworker batch
+        batchSummaryQueued summary1 `shouldBe` 4
+        ls <- jobs hworker
+        length ls `shouldBe` 0
+        threadDelay 100000
+        summary2 <- expectBatchSummary hworker batch
+        batchSummaryQueued summary2 `shouldBe` 0
+        killThread thread
+        destroy hworker
+
 
   describe "Monitor" $ do
     it "should add job back after timeout" $ do
@@ -321,8 +397,10 @@ main = hspec $ do
       killThread wthread1
       wthread2 <- forkIO (worker hworker)
       threadDelay 10000000
-      destroy hworker
       v <- takeMVar mvar
+      killThread wthread2
+      killThread mthread
+      destroy hworker
       assertEqual "State should be 1, since first failed" 1 v
 
     it "should add back multiple jobs after timeout" $ do
@@ -345,6 +423,8 @@ main = hspec $ do
       threadDelay 10000000
       destroy hworker
       v <- takeMVar mvar
+      killThread wthread3
+      killThread mthread
       assertEqual "State should be 2, since first 2 failed" 2 v
 
     it "should work with multiple monitors" $ do
@@ -371,6 +451,8 @@ main = hspec $ do
       threadDelay 30000000
       destroy hworker
       v <- takeMVar mvar
+      killThread wthread3
+      mapM_ killThread [mthread1, mthread2, mthread3, mthread4, mthread5, mthread6]
       assertEqual "State should be 2, since first 2 failed" 2 v
       -- NOTE(dbp 2015-07-24): It would be really great to have a
       -- test that went after a race between the retry logic and
@@ -393,12 +475,12 @@ main = hspec $ do
       wthread <- forkIO (worker hworker1)
       queue hworker2 SimpleJob
       threadDelay 100000
-      jobs <- broken hworker2
+      brokenJobs <- broken hworker2
       killThread wthread
       destroy hworker1
       v <- takeMVar mvar
       assertEqual "State should be 0, as nothing should have happened" 0 v
-      assertEqual "Should be one broken job, as serialization is wrong" 1 (length jobs)
+      assertEqual "Should be one broken job, as serialization is wrong" 1 (length brokenJobs)
 
   describe "Dump jobs" $ do
     it "should return the job that was queued" $ do
@@ -445,7 +527,7 @@ instance ToJSON SimpleJob
 instance FromJSON SimpleJob
 
 newtype SimpleState =
-  SimpleState { unSimpleState :: MVar Int }
+  SimpleState (MVar Int)
 
 instance Job SimpleState SimpleJob where
   job (SimpleState mvar) SimpleJob =
@@ -459,7 +541,7 @@ instance ToJSON ExJob
 instance FromJSON ExJob
 
 newtype ExState =
-  ExState { unExState :: MVar Int }
+  ExState (MVar Int)
 
 instance Job ExState ExJob where
   job (ExState mvar) ExJob = do
@@ -477,7 +559,7 @@ instance ToJSON RetryJob
 instance FromJSON RetryJob
 
 newtype RetryState =
-  RetryState { unRetryState :: MVar Int }
+  RetryState (MVar Int)
 
 instance Job RetryState RetryJob where
   job (RetryState mvar) RetryJob = do
@@ -495,7 +577,7 @@ instance ToJSON FailJob
 instance FromJSON FailJob
 
 newtype FailState =
-  FailState { unFailState :: MVar Int }
+  FailState (MVar Int)
 
 instance Job FailState FailJob where
   job (FailState mvar) FailJob = do
@@ -513,7 +595,7 @@ instance ToJSON AlwaysFailJob
 instance FromJSON AlwaysFailJob
 
 newtype AlwaysFailState =
-  AlwaysFailState { unAlwaysFailState :: MVar Int }
+  AlwaysFailState (MVar Int)
 
 instance Job AlwaysFailState AlwaysFailJob where
   job (AlwaysFailState mvar) AlwaysFailJob = do
@@ -528,7 +610,7 @@ instance ToJSON TimedJob
 instance FromJSON TimedJob
 
 newtype TimedState =
-  TimedState { unTimedState :: MVar Int }
+  TimedState (MVar Int)
 
 instance Job TimedState TimedJob where
   job (TimedState mvar) (TimedJob delay) = do
@@ -544,7 +626,7 @@ instance ToJSON BigJob
 instance FromJSON BigJob
 
 newtype BigState =
-  BigState { unBigState :: MVar Int }
+  BigState (MVar Int)
 
 instance Job BigState BigJob where
   job (BigState mvar) (BigJob _) =
