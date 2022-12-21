@@ -303,6 +303,7 @@ data HworkerConfig s =
     , hwconfigTimeout           :: NominalDiffTime
     , hwconfigFailedQueueSize   :: Int
     , hwconfigDebug             :: Bool
+    , hwconfigBatchCompleted    :: BatchSummary -> IO ()
     }
 
 
@@ -320,6 +321,7 @@ defaultHworkerConfig name state =
     , hwconfigTimeout           = 120
     , hwconfigFailedQueueSize   = 1000
     , hwconfigDebug             = False
+    , hwconfigBatchCompleted    = const (return ())
     }
 
 
@@ -357,7 +359,7 @@ createWith HworkerConfig{..} = do
       , hworkerJobTimeout        = hwconfigTimeout
       , hworkerFailedQueueSize   = hwconfigFailedQueueSize
       , hworkerDebug             = hwconfigDebug
-      , hworkerBatchCompleted    = const (return ())
+      , hworkerBatchCompleted    = hwconfigBatchCompleted
       }
 
 
