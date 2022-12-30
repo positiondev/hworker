@@ -9,12 +9,13 @@ import           Control.Concurrent       ( forkIO, killThread, threadDelay )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
                                           , readMVar, takeMVar
                                           )
-import           Control.Monad            ( replicateM_, void )
+import           Control.Monad            ( replicateM_, when, void )
 import           Control.Monad.Trans      ( lift, liftIO )
 import           Data.Aeson               ( FromJSON(..), ToJSON(..) )
 import qualified Data.Conduit            as Conduit
 import           Data.Text                ( Text )
 import qualified Data.Text               as T
+import           Data.Time
 import qualified Database.Redis          as Redis
 import           GHC.Generics             ( Generic)
 import           Test.Hspec
@@ -22,7 +23,8 @@ import           Test.HUnit               ( assertEqual )
 --------------------------------------------------------------------------------
 import           System.Hworker
 --------------------------------------------------------------------------------
-
+import Data.UUID (toText)
+import Data.UUID.V4 (nextRandom)
 
 
 main :: IO ()
@@ -462,6 +464,48 @@ main = hspec $ do
       -- precision without adding other delay mechanisms, or
       -- something to make it more deterministic.
 
+  describe "Scheduled and Recurring Jobs" $ do
+    it "should execute job at scheduled time" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      wthread <- forkIO (worker hworker)
+      mthread <- forkIO (monitor hworker)
+      time <- getCurrentTime
+      queueScheduled hworker SimpleJob Nothing (addUTCTime 1 time)
+      queueScheduled hworker SimpleJob Nothing (addUTCTime 2 time)
+      queueScheduled hworker SimpleJob Nothing (addUTCTime 4 time)
+      threadDelay 1500000 >> readMVar mvar >>= shouldBe 1
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 3
+      killThread wthread
+      killThread mthread
+      destroy hworker
+
+    it "should execute a recurring job" $ do
+      recur <- toText <$> nextRandom
+      mvar <- newMVar 0
+      hworker <-
+        createWith (conf "simpleworker-1" (SimpleState mvar))
+          { hwconfigRecurringJob =
+              \hw r _ -> do
+                when (r == recur) $ do
+                  time <- getCurrentTime
+                  void $ queueScheduled hw SimpleJob (Just r) (addUTCTime 1.99 time)
+          }
+
+      wthread <- forkIO (worker hworker)
+      mthread <- forkIO (monitor hworker)
+      time <- getCurrentTime
+      queueScheduled hworker SimpleJob (Just recur) (addUTCTime 2 time)
+      threadDelay 3000000 >> readMVar mvar >>= shouldBe 1
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 3
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 4
+      destroy hworker
+      killThread wthread
+      killThread mthread
+
   describe "Broken jobs" $
     it "should store broken jobs" $ do
       -- NOTE(dbp 2015-08-09): The more common way this could
@@ -633,7 +677,7 @@ instance Job BigState BigJob where
     modifyMVarMasked_ mvar (return . (+1)) >> return Success
 
 
-conf :: Text -> s -> HworkerConfig s
+conf :: Text -> s -> HworkerConfig s t
 conf n s =
   (defaultHworkerConfig n s)
     { hwconfigLogger = const (return ())

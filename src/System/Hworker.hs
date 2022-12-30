@@ -66,6 +66,7 @@ module System.Hworker
   , monitor
     -- * Queuing Jobs
   , queue
+  , queueScheduled
   , queueBatch
   , streamBatch
   , initBatch
@@ -90,7 +91,7 @@ import           Control.Exception       ( SomeException
                                          )
 import           Control.Monad           ( forM_, forever, void, when )
 import           Control.Monad.Trans     ( liftIO, lift )
-import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:) )
+import           Data.Aeson              ( FromJSON, ToJSON, (.=), (.:), (.:?) )
 import qualified Data.Aeson             as A
 import           Data.ByteString         ( ByteString )
 import qualified Data.ByteString.Char8  as B8
@@ -103,10 +104,11 @@ import           Data.Text               ( Text )
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
 import           Data.Time.Clock         ( NominalDiffTime
-                                         , UTCTime (..)
+                                         , UTCTime(..)
                                          , diffUTCTime
                                          , getCurrentTime
                                          )
+import qualified Data.Time.Clock.POSIX  as Posix
 import           Data.UUID               ( UUID )
 import qualified Data.UUID              as UUID
 import qualified Data.UUID.V4           as UUID
@@ -178,6 +180,9 @@ data ExceptionBehavior
 type JobId = Text
 
 
+type RecurringId = Text
+
+
 -- | A unique identifier for grouping jobs together.
 
 newtype BatchId =
@@ -218,12 +223,12 @@ data BatchSummary =
 
 
 data JobRef =
-  JobRef JobId (Maybe BatchId)
+  JobRef JobId (Maybe BatchId) (Maybe RecurringId)
   deriving (Eq, Show)
 
 
 instance ToJSON JobRef where
-  toJSON (JobRef j b) = A.object ["j" .= j, "b" .= b]
+  toJSON (JobRef j b r) = A.object ["j" .= j, "b" .= b, "r" .= r]
 
 
 instance FromJSON JobRef where
@@ -231,8 +236,8 @@ instance FromJSON JobRef where
   -- can be removed eventually. Before `JobRef`, which is encoded as
   -- a JSON object, there was a just a `String` representing the job ID.
 
-  parseJSON (A.String j) = pure (JobRef j Nothing)
-  parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b") val
+  parseJSON (A.String j) = pure (JobRef j Nothing Nothing)
+  parseJSON val = A.withObject "JobRef" (\o -> JobRef <$> o .: "j" <*> o .: "b" <*> o .:? "r") val
 
 
 hwlog :: Show a => Hworker s t -> a -> IO ()
@@ -254,6 +259,7 @@ data Hworker s t =
     , hworkerFailedQueueSize   :: Int
     , hworkerDebug             :: Bool
     , hworkerBatchCompleted    :: BatchSummary -> IO ()
+    , hworkerRecurringJob      :: Hworker s t -> RecurringId -> Result -> IO ()
     }
 
 
@@ -293,7 +299,7 @@ data RedisConnection
 -- 'hwconfigFailedQueueSize' controls how many 'failed' jobs will be
 -- kept. It defaults to 1000.
 
-data HworkerConfig s =
+data HworkerConfig s t =
   HworkerConfig
     { hwconfigName              :: Text
     , hwconfigState             :: s
@@ -304,13 +310,14 @@ data HworkerConfig s =
     , hwconfigFailedQueueSize   :: Int
     , hwconfigDebug             :: Bool
     , hwconfigBatchCompleted    :: BatchSummary -> IO ()
+    , hwconfigRecurringJob      :: Hworker s t -> RecurringId -> Result -> IO ()
     }
 
 
 -- | The default worker config - it needs a name and a state (as those
 -- will always be unique).
 
-defaultHworkerConfig :: Text -> s -> HworkerConfig s
+defaultHworkerConfig :: Text -> s -> HworkerConfig s t
 defaultHworkerConfig name state =
   HworkerConfig
     { hwconfigName              = name
@@ -322,6 +329,7 @@ defaultHworkerConfig name state =
     , hwconfigFailedQueueSize   = 1000
     , hwconfigDebug             = False
     , hwconfigBatchCompleted    = const (return ())
+    , hwconfigRecurringJob      = \_ _ _ -> return ()
     }
 
 
@@ -342,7 +350,7 @@ create name state =
 -- the queue to actually process jobs (and for it to retry ones that
 -- time-out).
 
-createWith :: Job s t => HworkerConfig s -> IO (Hworker s t)
+createWith :: Job s t => HworkerConfig s t -> IO (Hworker s t)
 createWith HworkerConfig{..} = do
   conn <-
     case hwconfigRedisConnectInfo of
@@ -360,6 +368,7 @@ createWith HworkerConfig{..} = do
       , hworkerFailedQueueSize   = hwconfigFailedQueueSize
       , hworkerDebug             = hwconfigDebug
       , hworkerBatchCompleted    = hwconfigBatchCompleted
+      , hworkerRecurringJob      = hwconfigRecurringJob
       }
 
 
@@ -385,6 +394,7 @@ destroy hw =
       , progressQueue hw
       , brokenQueue hw
       , failedQueue hw
+      , scheduleQueue hw
       ]
 
 
@@ -408,6 +418,11 @@ failedQueue hw =
   "hworker-failed-" <> hworkerName hw
 
 
+scheduleQueue :: Hworker s t -> ByteString
+scheduleQueue hw =
+  "hworker-scheduled-" <> hworkerName hw
+
+
 batchCounter :: Hworker s t -> BatchId -> ByteString
 batchCounter hw (BatchId batch) =
   "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
@@ -420,7 +435,21 @@ queue hw j = do
   jobId <- UUID.toText <$> UUID.nextRandom
   result <-
     runRedis (hworkerConnection hw)
-      $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef jobId Nothing, j)]
+      $ R.lpush (jobQueue hw)
+      $ [LB.toStrict $ A.encode (JobRef jobId Nothing Nothing, j)]
+  return $ isRight result
+
+
+-- | Adds a job to be added to the queue at the specified time.
+-- Returns whether the operation succeeded.
+
+queueScheduled :: Job s t => Hworker s t -> t -> Maybe RecurringId -> UTCTime -> IO Bool
+queueScheduled hw j recurring utc = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  result <-
+    runRedis (hworkerConnection hw)
+      $ R.zadd (scheduleQueue hw)
+      $ [(utcToDouble utc, LB.toStrict $ A.encode (JobRef jobId Nothing recurring, j))]
   return $ isRight result
 
 
@@ -438,7 +467,7 @@ queueBatch hw batch close js =
       mapM_
         ( \j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
-            let ref = JobRef jobId (Just batch)
+            let ref = JobRef jobId (Just batch) Nothing
             _ <- R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
 
             -- Do the counting outside of the transaction, hence runRedis here.
@@ -474,7 +503,7 @@ streamBatch hw batch close producer =
 
           Just j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
-            let ref = JobRef jobId (Just batch)
+            let ref = JobRef jobId (Just batch) Nothing
             _ <- lift $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
 
             -- Do the counting outside of the transaction, hence runRedis here.
@@ -569,6 +598,11 @@ worker hw =
     justRun =
       worker hw
 
+    handleRecurring maybeRecurring result =
+      case maybeRecurring of
+        Nothing        -> return ()
+        Just recurring -> (hworkerRecurringJob hw) hw recurring result
+
     runJob action = do
       eitherResult <-
         catchJust
@@ -637,11 +671,12 @@ worker hw =
 
           delayAndRun
 
-        Just (JobRef _ maybeBatch, j) -> do
+        Just (JobRef _ maybeBatch maybeRecurring, j) -> do
           runJob (job (hworkerState hw) j) >>=
             \case
               Success -> do
                 when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE" :: Text, t)
+                handleRecurring maybeRecurring Success
 
                 case maybeBatch of
                   Nothing -> do
@@ -687,12 +722,11 @@ worker hw =
                               justRun
                       )
 
-
               Retry msg -> do
                 hwlog hw ("RETRY: " <> msg)
 
                 case maybeBatch of
-                  Nothing -> do
+                  Nothing ->
                     withNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
@@ -703,9 +737,7 @@ worker hw =
                         [progressQueue hw, jobQueue hw]
                         [t]
 
-                    delayAndRun
-
-                  Just batch -> do
+                  Just batch ->
                     withNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
@@ -717,13 +749,14 @@ worker hw =
                         [progressQueue hw, jobQueue hw, batchCounter hw batch]
                         [t]
 
-                    delayAndRun
+                handleRecurring maybeRecurring (Retry msg)
+                delayAndRun
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
 
                 case maybeBatch of
-                  Nothing -> do
+                  Nothing ->
                     withNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
@@ -735,9 +768,7 @@ worker hw =
                         [progressQueue hw, failedQueue hw]
                         [t, B8.pack (show (hworkerFailedQueueSize hw - 1))]
 
-                    delayAndRun
-
-                  Just batch -> do
+                  Just batch ->
                     withMaybe hw
                       ( R.eval
                           "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
@@ -762,7 +793,9 @@ worker hw =
                           forM_ (decodeBatchSummary batch hm)
                             $ hworkerBatchCompleted hw
                       )
-                    delayAndRun
+
+                handleRecurring maybeRecurring (Failure msg)
+                delayAndRun
 
 
 -- | Start a monitor. Like 'worker', this is blocking, so should be
@@ -775,6 +808,25 @@ monitor :: Job s t => Hworker s t -> IO ()
 monitor hw =
   forever $ do
     now <- getCurrentTime
+
+    runRedis (hworkerConnection hw) $ do
+      R.zcount (scheduleQueue hw) 0 (utcToDouble now) >>=
+        \case
+          Right n | n > 0 ->
+            withNil' hw $
+              R.eval
+                "local jobs = redis.call('zrangebyscore', KEYS[1], '0', ARGV[1])\n\
+                \redis.call('lpush', KEYS[2], unpack(jobs))\n\
+                \redis.call('zremrangebyscore', KEYS[1], '0', ARGV[1])\n\
+                \return nil"
+                [scheduleQueue hw, jobQueue hw]
+                [B8.pack (show (utcToDouble now))]
+
+          Right _ ->
+            return ()
+
+          Left err ->
+            liftIO $ hwlog hw err
 
     withList hw (R.hkeys (progressQueue hw)) $ \js ->
       forM_ js $ \j ->
@@ -833,7 +885,7 @@ jobsFromQueue hw q =
         return []
 
       Right xs ->
-        return $ mapMaybe (fmap (\(JobRef _ _, x) -> x) . A.decodeStrict) xs
+        return $ mapMaybe (fmap (\(JobRef _ _ _, x) -> x) . A.decodeStrict) xs
 
 
 -- | Returns all pending jobs.
@@ -941,6 +993,15 @@ withNil hw a =
       Right _  -> return ()
 
 
+withNil' ::
+  Show a => Hworker s t -> Redis (Either a (Maybe ByteString)) -> Redis ()
+withNil' hw a =
+  a >>=
+    \case
+      Left err -> liftIO $ hwlog hw err
+      Right _  -> return ()
+
+
 withInt :: Hworker s t -> Redis (Either R.Reply Integer) -> IO Integer
 withInt hw a =
   runRedis (hworkerConnection hw) a >>=
@@ -1002,3 +1063,7 @@ resetBatchSummary hw BatchSummary{..} =
       , ("retries", encode batchSummaryRetries)
       , ("status", encodeBatchStatus batchSummaryStatus)
       ]
+
+
+utcToDouble :: UTCTime -> Double
+utcToDouble = realToFrac . Posix.utcTimeToPOSIXSeconds
