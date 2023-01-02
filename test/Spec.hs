@@ -9,7 +9,7 @@ import           Control.Concurrent       ( forkIO, killThread, threadDelay )
 import           Control.Concurrent.MVar  ( MVar, modifyMVarMasked_, newMVar
                                           , readMVar, takeMVar
                                           )
-import           Control.Monad            ( replicateM_, when, void )
+import           Control.Monad            ( replicateM_, void )
 import           Control.Monad.Trans      ( lift, liftIO )
 import           Data.Aeson               ( FromJSON(..), ToJSON(..) )
 import qualified Data.Conduit            as Conduit
@@ -23,8 +23,7 @@ import           Test.HUnit               ( assertEqual )
 --------------------------------------------------------------------------------
 import           System.Hworker
 --------------------------------------------------------------------------------
-import Data.UUID (toText)
-import Data.UUID.V4 (nextRandom)
+
 
 
 main :: IO ()
@@ -266,7 +265,7 @@ main = hspec $ do
       killThread wthread
       destroy hworker
 
-    it "should change job status finished when last processed" $ do
+    it "should change job status to finished when last processed" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
@@ -471,9 +470,9 @@ main = hspec $ do
       wthread <- forkIO (worker hworker)
       mthread <- forkIO (monitor hworker)
       time <- getCurrentTime
-      queueScheduled hworker SimpleJob Nothing (addUTCTime 1 time)
-      queueScheduled hworker SimpleJob Nothing (addUTCTime 2 time)
-      queueScheduled hworker SimpleJob Nothing (addUTCTime 4 time)
+      queueScheduled hworker SimpleJob (addUTCTime 1 time)
+      queueScheduled hworker SimpleJob (addUTCTime 2 time)
+      queueScheduled hworker SimpleJob (addUTCTime 4 time)
       threadDelay 1500000 >> readMVar mvar >>= shouldBe 1
       threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
       threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
@@ -483,21 +482,12 @@ main = hspec $ do
       destroy hworker
 
     it "should execute a recurring job" $ do
-      recur <- toText <$> nextRandom
       mvar <- newMVar 0
-      hworker <-
-        createWith (conf "simpleworker-1" (SimpleState mvar))
-          { hwconfigRecurringJob =
-              \hw r _ -> do
-                when (r == recur) $ do
-                  time <- getCurrentTime
-                  void $ queueScheduled hw SimpleJob (Just r) (addUTCTime 1.99 time)
-          }
-
+      hworker <- createWith (conf "recurringworker-1" (RecurringState mvar))
       wthread <- forkIO (worker hworker)
       mthread <- forkIO (monitor hworker)
       time <- getCurrentTime
-      queueScheduled hworker SimpleJob (Just recur) (addUTCTime 2 time)
+      queueScheduled hworker RecurringJob (addUTCTime 2 time)
       threadDelay 3000000 >> readMVar mvar >>= shouldBe 1
       threadDelay 2000000 >> readMVar mvar >>= shouldBe 2
       threadDelay 2000000 >> readMVar mvar >>= shouldBe 3
@@ -574,7 +564,7 @@ newtype SimpleState =
   SimpleState (MVar Int)
 
 instance Job SimpleState SimpleJob where
-  job (SimpleState mvar) SimpleJob =
+  job Hworker { hworkerState = SimpleState mvar } SimpleJob =
     modifyMVarMasked_ mvar (return . (+1)) >> return Success
 
 
@@ -588,7 +578,7 @@ newtype ExState =
   ExState (MVar Int)
 
 instance Job ExState ExJob where
-  job (ExState mvar) ExJob = do
+  job Hworker { hworkerState = ExState mvar } ExJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -606,7 +596,7 @@ newtype RetryState =
   RetryState (MVar Int)
 
 instance Job RetryState RetryJob where
-  job (RetryState mvar) RetryJob = do
+  job Hworker { hworkerState = RetryState mvar } RetryJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -624,7 +614,7 @@ newtype FailState =
   FailState (MVar Int)
 
 instance Job FailState FailJob where
-  job (FailState mvar) FailJob = do
+  job Hworker { hworkerState = FailState mvar } FailJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -642,7 +632,7 @@ newtype AlwaysFailState =
   AlwaysFailState (MVar Int)
 
 instance Job AlwaysFailState AlwaysFailJob where
-  job (AlwaysFailState mvar) AlwaysFailJob = do
+  job Hworker { hworkerState = AlwaysFailState mvar} AlwaysFailJob = do
     modifyMVarMasked_ mvar (return . (+1))
     return (Failure "AlwaysFailJob fails")
 
@@ -657,7 +647,7 @@ newtype TimedState =
   TimedState (MVar Int)
 
 instance Job TimedState TimedJob where
-  job (TimedState mvar) (TimedJob delay) = do
+  job Hworker { hworkerState = TimedState mvar } (TimedJob delay) = do
     threadDelay delay
     modifyMVarMasked_ mvar (return . (+1))
     return Success
@@ -673,11 +663,28 @@ newtype BigState =
   BigState (MVar Int)
 
 instance Job BigState BigJob where
-  job (BigState mvar) (BigJob _) =
+  job Hworker { hworkerState = BigState mvar } (BigJob _) =
     modifyMVarMasked_ mvar (return . (+1)) >> return Success
 
 
-conf :: Text -> s -> HworkerConfig s t
+data RecurringJob =
+  RecurringJob deriving (Generic, Show, Eq)
+
+instance ToJSON RecurringJob
+instance FromJSON RecurringJob
+
+newtype RecurringState =
+  RecurringState (MVar Int)
+
+instance Job RecurringState RecurringJob where
+  job hw@Hworker{ hworkerState = RecurringState mvar} RecurringJob = do
+    modifyMVarMasked_ mvar (return . (+1))
+    time <- getCurrentTime
+    queueScheduled hw RecurringJob (addUTCTime 1.99 time)
+    return Success
+
+
+conf :: Text -> s -> HworkerConfig s
 conf n s =
   (defaultHworkerConfig n s)
     { hwconfigLogger = const (return ())
