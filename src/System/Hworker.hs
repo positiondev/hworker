@@ -197,6 +197,7 @@ newtype BatchId =
 
 data BatchStatus
   = BatchQueueing
+  | BatchFailed
   | BatchProcessing
   | BatchFinished
   deriving (Eq, Show)
@@ -480,9 +481,9 @@ queueBatch hw batch close js =
 
 data QueueingResult
   = BatchNotFound BatchId
-  | TransactionAborted BatchSummary
+  | TransactionAborted BatchId Int
   | QueueingSuccess BatchSummary
-  | QueueingFailed Text BatchSummary
+  | QueueingFailed BatchId Int Text
   | AlreadyQueued BatchSummary
   deriving (Eq, Show)
 
@@ -538,16 +539,16 @@ withBatchQueue hw batch process =
                   return $ QueueingSuccess summary
 
                 TxAborted -> do
-                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return $ TransactionAborted summary
+                  n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                  return $ TransactionAborted batch n
 
                 TxError err -> do
-                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return $ QueueingFailed (T.pack err) summary
+                  n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                  return $ QueueingFailed batch n (T.pack err)
           )
           ( \(e :: SomeException) -> do
-              runRedis (hworkerConnection hw) (resetBatchSummary hw summary)
-              return $ QueueingFailed (T.pack (show e)) summary
+              n <- runRedis (hworkerConnection hw) (failBatchSummary hw batch)
+              return $ QueueingFailed batch n (T.pack (show e))
           )
 
       Just summary ->
@@ -997,12 +998,14 @@ runWithInt hw a =
 
 encodeBatchStatus :: BatchStatus -> ByteString
 encodeBatchStatus BatchQueueing   = "queueing"
+encodeBatchStatus BatchFailed     = "failed"
 encodeBatchStatus BatchProcessing = "processing"
 encodeBatchStatus BatchFinished   = "finished"
 
 
 decodeBatchStatus :: ByteString -> Maybe BatchStatus
 decodeBatchStatus "queueing"   = Just BatchQueueing
+decodeBatchStatus "failed"     = Just BatchFailed
 decodeBatchStatus "processing" = Just BatchProcessing
 decodeBatchStatus "finished"   = Just BatchFinished
 decodeBatchStatus _            = Nothing
@@ -1031,21 +1034,16 @@ readMaybe =
   fmap fst . listToMaybe . reads . B8.unpack
 
 
-resetBatchSummary :: R.RedisCtx m n => Hworker s t -> BatchSummary -> m ()
-resetBatchSummary hw BatchSummary{..} =
-  let
-    encode =
-      B8.pack . show
-  in
-  void $
-    R.hmset (batchCounter hw batchSummaryID)
-      [ ("queued", encode batchSummaryQueued)
-      , ("completed", encode batchSummaryCompleted)
-      , ("successes", encode batchSummarySuccesses)
-      , ("failures", encode batchSummaryFailures)
-      , ("retries", encode batchSummaryRetries)
-      , ("status", encodeBatchStatus batchSummaryStatus)
-      ]
+failBatchSummary :: Hworker s t -> BatchId -> Redis Int
+failBatchSummary hw batch = do
+  void
+    $ R.hset (batchCounter hw batch) "status"
+    $ encodeBatchStatus BatchFailed
+
+  batchSummary' hw batch >>=
+    \case
+      Just summary -> return $ batchSummaryQueued summary
+      _            -> return 0
 
 
 utcToDouble :: UTCTime -> Double

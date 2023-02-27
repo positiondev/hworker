@@ -349,7 +349,7 @@ main = hspec $ do
         destroy hworker
         length ls `shouldBe` 0
 
-      it "should increment summary but then reset after failure" $ do
+      it "should increment summary up until failure" $ do
         mvar <- newMVar 0
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
@@ -369,7 +369,8 @@ main = hspec $ do
         length ls `shouldBe` 0
         threadDelay 100000
         summary2 <- expectBatchSummary hworker batch
-        batchSummaryQueued summary2 `shouldBe` 0
+        batchSummaryQueued summary2 `shouldBe` 5
+        batchSummaryStatus summary2 `shouldBe` BatchFailed
         killThread thread
         destroy hworker
 
