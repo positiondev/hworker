@@ -57,6 +57,7 @@ module System.Hworker
   , BatchId(..)
   , BatchStatus(..)
   , BatchSummary(..)
+  , QueueingResult(..)
     -- * Managing Workers
   , create
   , createWith
@@ -453,7 +454,7 @@ queueScheduled hw j utc = do
 -- so that if a single job fails to queue then then none of the jobs
 -- in the list will queue.
 
-queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO Bool
+queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO QueueingResult
 queueBatch hw batch close js =
   withBatchQueue hw batch $ runRedis (hworkerConnection hw) $
     R.multiExec $ do
@@ -477,12 +478,21 @@ queueBatch hw batch close js =
       return (pure ())
 
 
+data QueueingResult
+  = BatchNotFound BatchId
+  | TransactionAborted BatchSummary
+  | QueueingSuccess BatchSummary
+  | QueueingFailed Text BatchSummary
+  | AlreadyQueued BatchSummary
+  deriving (Eq, Show)
+
+
 -- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
 -- that streams jobs in.
 
 streamBatch ::
   Job s t =>
-  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx () -> IO Bool
+  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx () -> IO QueueingResult
 streamBatch hw batch close producer =
   let
     sink =
@@ -513,45 +523,35 @@ streamBatch hw batch close producer =
 
 
 withBatchQueue ::
-  Job s t => Hworker s t -> BatchId -> IO (TxResult ()) -> IO Bool
+  Job s t => Hworker s t -> BatchId -> IO (TxResult ()) -> IO QueueingResult
 withBatchQueue hw batch process =
   runRedis (hworkerConnection hw) (batchSummary' hw batch) >>=
     \case
-      Nothing -> do
-        hwlog hw $ "BATCH NOT FOUND: " <> show batch
-        return False
+      Nothing ->
+        return $ BatchNotFound batch
 
       Just summary | batchSummaryStatus summary == BatchQueueing ->
         catch
           ( process >>=
               \case
                 TxSuccess () ->
-                  return True
+                  return $ QueueingSuccess summary
 
                 TxAborted -> do
-                  hwlog hw ("TRANSACTION ABORTED" :: String)
                   runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return False
+                  return $ TransactionAborted summary
 
                 TxError err -> do
-                  hwlog hw err
                   runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return False
+                  return $ QueueingFailed (T.pack err) summary
           )
           ( \(e :: SomeException) -> do
-              hwlog hw $ show e
               runRedis (hworkerConnection hw) (resetBatchSummary hw summary)
-              return False
+              return $ QueueingFailed (T.pack (show e)) summary
           )
 
-      Just _-> do
-        hwlog hw $
-          mconcat
-            [ "QUEUEING COMPLETED FOR BATCH: "
-            , show batch
-            , ". CANNOT ENQUEUE NEW JOBS."
-            ]
-        return False
+      Just summary ->
+        return $ AlreadyQueued summary
 
 
 -- | Prevents queueing new jobs to a batch. If the number of jobs completed equals

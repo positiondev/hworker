@@ -201,10 +201,12 @@ main = hspec $ do
       queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
-      queueBatch hworker batch False [SimpleJob] >>= shouldBe False
-      threadDelay 30000
       summary <- expectBatchSummary hworker batch
-      batchSummaryQueued summary `shouldBe` 1
+      queueBatch hworker batch False [SimpleJob]
+        >>= shouldBe (AlreadyQueued summary)
+      threadDelay 30000
+      summary' <- expectBatchSummary hworker batch
+      batchSummaryQueued summary' `shouldBe` 1
       killThread wthread
       destroy hworker
 
