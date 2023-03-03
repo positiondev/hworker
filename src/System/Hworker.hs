@@ -58,6 +58,7 @@ module System.Hworker
   , BatchStatus(..)
   , BatchSummary(..)
   , QueueingResult(..)
+  , QueueJob(..)
     -- * Managing Workers
   , create
   , createWith
@@ -85,6 +86,8 @@ module System.Hworker
 import           Control.Arrow           ( second)
 import           Control.Concurrent      ( threadDelay)
 import           Control.Exception       ( SomeException
+                                         , Exception
+                                         , throw
                                          , catch
                                          , catchJust
                                          , asyncExceptionFromException
@@ -491,21 +494,46 @@ data QueueingResult
 -- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
 -- that streams jobs in.
 
+
+data QueueJob a
+  = QueueJob a
+  | AbortQueueing Text
+
+
+data AbortException =
+  AbortException Text
+  deriving Show
+
+
+instance Exception AbortException
+
+
 streamBatch ::
   Job s t =>
-  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx () -> IO QueueingResult
+  Hworker s t -> BatchId -> Bool -> ConduitT () (QueueJob t) RedisTx () ->
+  IO QueueingResult
 streamBatch hw batch close producer =
   let
     sink =
       Conduit.await >>=
         \case
-          Nothing -> do
-            when close
-              $ void . lift
-              $ R.hset (batchCounter hw batch) "status" "processing"
-            return (pure ())
+          Nothing ->
+            liftIO (batchSummary hw batch) >>=
+              \case
+                Just summary | batchSummaryQueued summary == 0 -> do
+                  void . lift $ R.hset (batchCounter hw batch) "status" "finished"
+                  return (pure ())
 
-          Just j -> do
+                _ -> do
+                  when close
+                    $ void . lift
+                    $ R.hset (batchCounter hw batch) "status" "processing"
+                  return (pure ())
+
+          Just (AbortQueueing message) -> do
+            throw (AbortException message)
+
+          Just (QueueJob j) -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
             let ref = JobRef jobId (Just batch)
             _ <- lift $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
@@ -533,18 +561,24 @@ withBatchQueue hw batch process =
 
       Just summary | batchSummaryStatus summary == BatchQueueing ->
         catch
-          ( process >>=
-              \case
-                TxSuccess () ->
-                  return $ QueueingSuccess summary
+          ( catch
+              ( process >>=
+                  \case
+                    TxSuccess () ->
+                      return $ QueueingSuccess summary
 
-                TxAborted -> do
-                  n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
-                  return $ TransactionAborted batch n
+                    TxAborted -> do
+                      n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                      return $ TransactionAborted batch n
 
-                TxError err -> do
-                  n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
-                  return $ QueueingFailed batch n (T.pack err)
+                    TxError err -> do
+                      n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                      return $ QueueingFailed batch n (T.pack err)
+              )
+              ( \(AbortException msg :: AbortException) -> do
+                  n <- runRedis (hworkerConnection hw) (failBatchSummary hw batch)
+                  return $ QueueingFailed batch n msg
+              )
           )
           ( \(e :: SomeException) -> do
               n <- runRedis (hworkerConnection hw) (failBatchSummary hw batch)

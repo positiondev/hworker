@@ -307,7 +307,7 @@ main = hspec $ do
         batch <- startBatch hworker Nothing
         streamBatch hworker batch True
           $ replicateM_ 50
-          $ Conduit.yield SimpleJob
+          $ Conduit.yield (QueueJob SimpleJob)
         ls <- jobs hworker
         length ls `shouldBe` 50
         summary <- expectBatchSummary hworker batch
@@ -320,10 +320,11 @@ main = hspec $ do
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
         streamBatch hworker batch True $ do
-          replicateM_ 20 $ Conduit.yield SimpleJob
-          error "BLOW UP!"
-          replicateM_ 20 $ Conduit.yield SimpleJob
+          replicateM_ 20 $ Conduit.yield (QueueJob SimpleJob)
+          Conduit.yield (AbortQueueing "abort")
+          replicateM_ 20 $ Conduit.yield (QueueJob SimpleJob)
         ls <- jobs hworker
+        expectBatchSummary hworker batch
         destroy hworker
         length ls `shouldBe` 0
 
@@ -332,9 +333,9 @@ main = hspec $ do
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
         streamBatch hworker batch True $ do
-          replicateM_ 20 $ Conduit.yield SimpleJob
+          replicateM_ 20 $ Conduit.yield (QueueJob SimpleJob)
           _ <- lift $ Redis.lpush "" []
-          replicateM_ 20 $ Conduit.yield SimpleJob
+          replicateM_ 20 $ Conduit.yield (QueueJob SimpleJob)
         ls <- jobs hworker
         destroy hworker
         length ls `shouldBe` 0
@@ -344,7 +345,7 @@ main = hspec $ do
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
         _ <- Redis.runRedis (hworkerConnection hworker) $ Redis.watch [batchCounter hworker batch]
-        streamBatch hworker batch True $ replicateM_ 20 $ Conduit.yield SimpleJob
+        streamBatch hworker batch True $ replicateM_ 20 $ Conduit.yield (QueueJob SimpleJob)
         ls <- jobs hworker
         destroy hworker
         length ls `shouldBe` 0
@@ -357,10 +358,10 @@ main = hspec $ do
         thread <-
           forkIO . void . streamBatch hworker batch True $ do
             replicateM_ 5 $
-              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+              Conduit.yield (QueueJob SimpleJob) >> liftIO (threadDelay 50000)
             error "BLOW UP!"
             replicateM_ 5 $
-              Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+              Conduit.yield (QueueJob SimpleJob) >> liftIO (threadDelay 50000)
 
         threadDelay 190000
         summary1 <- expectBatchSummary hworker batch
