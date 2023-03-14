@@ -58,7 +58,7 @@ module System.Hworker
   , BatchStatus(..)
   , BatchSummary(..)
   , QueueingResult(..)
-  , QueueJob(..)
+  , StreamingResult(..)
     -- * Managing Workers
   , create
   , createWith
@@ -70,6 +70,7 @@ module System.Hworker
   , queueScheduled
   , queueBatch
   , streamBatch
+  , streamBatchTx
   , initBatch
   , stopBatchQueueing
     -- * Inspecting Workers
@@ -189,6 +190,26 @@ type JobId = Text
 newtype BatchId =
   BatchId UUID
   deriving (ToJSON, FromJSON, Eq, Show)
+
+
+-- | The result of a batch of jobs queued atomically.
+
+data QueueingResult
+  = BatchNotFound BatchId
+  | TransactionAborted BatchId Int
+  | QueueingSuccess BatchSummary
+  | QueueingFailed BatchId Int Text
+  | AlreadyQueued BatchSummary
+  deriving (Eq, Show)
+
+
+-- | The return value of a batch of jobs that are streamed in.
+
+data StreamingResult
+  = StreamingOk            -- End the stream successfully
+  | StreamingAborted Text  -- Close the stream with the given error message,
+                           -- reverting all previously added jobs
+
 
 
 -- | Represents the current status of a batch. A batch is considered to be
@@ -482,24 +503,6 @@ queueBatch hw batch close js =
       return (pure ())
 
 
-data QueueingResult
-  = BatchNotFound BatchId
-  | TransactionAborted BatchId Int
-  | QueueingSuccess BatchSummary
-  | QueueingFailed BatchId Int Text
-  | AlreadyQueued BatchSummary
-  deriving (Eq, Show)
-
-
--- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
--- that streams jobs in.
-
-
-data QueueJob a
-  = QueueJob a
-  | AbortQueueing Text
-
-
 data AbortException =
   AbortException Text
   deriving Show
@@ -508,11 +511,24 @@ data AbortException =
 instance Exception AbortException
 
 
+-- | TODO
+
 streamBatch ::
   Job s t =>
-  Hworker s t -> BatchId -> Bool -> ConduitT () (QueueJob t) RedisTx () ->
+  Hworker s t -> BatchId -> Bool -> ConduitT () t IO StreamingResult ->
   IO QueueingResult
 streamBatch hw batch close producer =
+  streamBatchTx hw batch close $ Conduit.transPipe liftIO producer
+
+
+-- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
+-- that streams jobs in within a Redis transaction.
+
+streamBatchTx ::
+  Job s t =>
+  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx StreamingResult ->
+  IO QueueingResult
+streamBatchTx hw batch close producer =
   let
     sink =
       Conduit.await >>=
@@ -520,20 +536,15 @@ streamBatch hw batch close producer =
           Nothing ->
             liftIO (batchSummary hw batch) >>=
               \case
-                Just summary | batchSummaryQueued summary == 0 -> do
+                Just summary | batchSummaryQueued summary == 0 ->
                   void . lift $ R.hset (batchCounter hw batch) "status" "finished"
-                  return (pure ())
 
-                _ -> do
+                _ ->
                   when close
                     $ void . lift
                     $ R.hset (batchCounter hw batch) "status" "processing"
-                  return (pure ())
 
-          Just (AbortQueueing message) -> do
-            throw (AbortException message)
-
-          Just (QueueJob j) -> do
+          Just j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
             let ref = JobRef jobId (Just batch)
             _ <- lift $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (ref, j)]
@@ -545,10 +556,17 @@ streamBatch hw batch close producer =
                 $ R.hincrby (batchCounter hw batch) "queued" 1
 
             sink
+
+    run =
+      Conduit.runConduit (Conduit.fuseUpstream producer sink) >>=
+        \case
+          StreamingOk          -> return (pure ())
+          StreamingAborted err -> throw (AbortException err)
   in
   withBatchQueue hw batch
     $ runRedis (hworkerConnection hw)
-    $ R.multiExec (Conduit.connect producer sink)
+    $ R.multiExec run
+
 
 
 withBatchQueue ::
