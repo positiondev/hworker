@@ -511,7 +511,8 @@ data AbortException =
 instance Exception AbortException
 
 
--- | TODO
+-- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
+-- that streams jobs within IO.
 
 streamBatch ::
   Job s t =>
@@ -521,8 +522,8 @@ streamBatch hw batch close producer =
   streamBatchTx hw batch close $ Conduit.transPipe liftIO producer
 
 
--- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
--- that streams jobs in within a Redis transaction.
+-- | Like 'streamBatch', but instead of IO, jobs are streamed directly within
+-- a Redis transaction.
 
 streamBatchTx ::
   Job s t =>
