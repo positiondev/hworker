@@ -29,7 +29,7 @@ also good examples):
 > instance FromJSON PrintJob
 >
 > instance Job State PrintJob where
->   job (State mvar) Print =
+>   job Hworker { hworkerState = State mvar } Print =
 >     do v <- takeMVar mvar
 >        putMVar mvar (v + 1)
 >        putStrLn $ "A(" ++ show v ++ ")"
@@ -57,23 +57,27 @@ module System.Hworker
   , BatchId(..)
   , BatchStatus(..)
   , BatchSummary(..)
+  , QueueingResult(..)
+  , StreamingResult(..)
     -- * Managing Workers
   , create
   , createWith
   , destroy
-  , batchSummary
   , worker
   , monitor
     -- * Queuing Jobs
   , queue
+  , queueScheduled
   , queueBatch
   , streamBatch
+  , streamBatchTx
   , initBatch
   , stopBatchQueueing
     -- * Inspecting Workers
   , jobs
   , failed
   , broken
+  , batchSummary
     -- * Debugging Utilities
   , debugger
   , batchCounter
@@ -83,6 +87,8 @@ module System.Hworker
 import           Control.Arrow           ( second)
 import           Control.Concurrent      ( threadDelay)
 import           Control.Exception       ( SomeException
+                                         , Exception
+                                         , throw
                                          , catch
                                          , catchJust
                                          , asyncExceptionFromException
@@ -103,10 +109,11 @@ import           Data.Text               ( Text )
 import qualified Data.Text              as T
 import qualified Data.Text.Encoding     as T
 import           Data.Time.Clock         ( NominalDiffTime
-                                         , UTCTime (..)
+                                         , UTCTime(..)
                                          , diffUTCTime
                                          , getCurrentTime
                                          )
+import qualified Data.Time.Clock.POSIX  as Posix
 import           Data.UUID               ( UUID )
 import qualified Data.UUID              as UUID
 import qualified Data.UUID.V4           as UUID
@@ -162,7 +169,7 @@ instance FromJSON Result
 -- possible and could be likely depending on your use.
 
 class (FromJSON t, ToJSON t, Show t) => Job s t | s -> t where
-  job :: s -> t -> IO Result
+  job :: Hworker s t -> t -> IO Result
 
 
 -- | What should happen when an unexpected exception is thrown in a
@@ -185,6 +192,26 @@ newtype BatchId =
   deriving (ToJSON, FromJSON, Eq, Show)
 
 
+-- | The result of a batch of jobs queued atomically.
+
+data QueueingResult
+  = BatchNotFound BatchId
+  | TransactionAborted BatchId Int
+  | QueueingSuccess BatchSummary
+  | QueueingFailed BatchId Int Text
+  | AlreadyQueued BatchSummary
+  deriving (Eq, Show)
+
+
+-- | The return value of a batch of jobs that are streamed in.
+
+data StreamingResult
+  = StreamingOk            -- End the stream successfully
+  | StreamingAborted Text  -- Close the stream with the given error message,
+                           -- reverting all previously added jobs
+
+
+
 -- | Represents the current status of a batch. A batch is considered to be
 -- "queueing" if jobs can still be added to the batch. While jobs are
 -- queueing it is possible for them to be "processing" during that time.
@@ -194,6 +221,7 @@ newtype BatchId =
 
 data BatchStatus
   = BatchQueueing
+  | BatchFailed
   | BatchProcessing
   | BatchFinished
   deriving (Eq, Show)
@@ -385,6 +413,7 @@ destroy hw =
       , progressQueue hw
       , brokenQueue hw
       , failedQueue hw
+      , scheduleQueue hw
       ]
 
 
@@ -408,6 +437,11 @@ failedQueue hw =
   "hworker-failed-" <> hworkerName hw
 
 
+scheduleQueue :: Hworker s t -> ByteString
+scheduleQueue hw =
+  "hworker-scheduled-" <> hworkerName hw
+
+
 batchCounter :: Hworker s t -> BatchId -> ByteString
 batchCounter hw (BatchId batch) =
   "hworker-batch-" <> hworkerName hw <> ":" <> UUID.toASCIIBytes batch
@@ -420,7 +454,21 @@ queue hw j = do
   jobId <- UUID.toText <$> UUID.nextRandom
   result <-
     runRedis (hworkerConnection hw)
-      $ R.lpush (jobQueue hw) [LB.toStrict $ A.encode (JobRef jobId Nothing, j)]
+      $ R.lpush (jobQueue hw)
+      $ [LB.toStrict $ A.encode (JobRef jobId Nothing, j)]
+  return $ isRight result
+
+
+-- | Adds a job to be added to the queue at the specified time.
+-- Returns whether the operation succeeded.
+
+queueScheduled :: Job s t => Hworker s t -> t -> UTCTime -> IO Bool
+queueScheduled hw j utc = do
+  jobId <- UUID.toText <$> UUID.nextRandom
+  result <-
+    runRedis (hworkerConnection hw)
+      $ R.zadd (scheduleQueue hw)
+      $ [(utcToDouble utc, LB.toStrict $ A.encode (JobRef jobId Nothing, j))]
   return $ isRight result
 
 
@@ -431,7 +479,7 @@ queue hw j = do
 -- so that if a single job fails to queue then then none of the jobs
 -- in the list will queue.
 
-queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO Bool
+queueBatch :: Job s t => Hworker s t -> BatchId -> Bool -> [t] -> IO QueueingResult
 queueBatch hw batch close js =
   withBatchQueue hw batch $ runRedis (hworkerConnection hw) $
     R.multiExec $ do
@@ -455,22 +503,47 @@ queueBatch hw batch close js =
       return (pure ())
 
 
+data AbortException =
+  AbortException Text
+  deriving Show
+
+
+instance Exception AbortException
+
+
 -- | Like 'queueBatch', but instead of a list of jobs, it takes a conduit
--- that streams jobs in.
+-- that streams jobs within IO.
 
 streamBatch ::
   Job s t =>
-  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx () -> IO Bool
+  Hworker s t -> BatchId -> Bool -> ConduitT () t IO StreamingResult ->
+  IO QueueingResult
 streamBatch hw batch close producer =
+  streamBatchTx hw batch close $ Conduit.transPipe liftIO producer
+
+
+-- | Like 'streamBatch', but instead of IO, jobs are streamed directly within
+-- a Redis transaction.
+
+streamBatchTx ::
+  Job s t =>
+  Hworker s t -> BatchId -> Bool -> ConduitT () t RedisTx StreamingResult ->
+  IO QueueingResult
+streamBatchTx hw batch close producer =
   let
     sink =
       Conduit.await >>=
         \case
-          Nothing -> do
-            when close
-              $ void . lift
-              $ R.hset (batchCounter hw batch) "status" "processing"
-            return (pure ())
+          Nothing ->
+            liftIO (batchSummary hw batch) >>=
+              \case
+                Just summary | batchSummaryQueued summary == 0 ->
+                  void . lift $ R.hset (batchCounter hw batch) "status" "finished"
+
+                _ ->
+                  when close
+                    $ void . lift
+                    $ R.hset (batchCounter hw batch) "status" "processing"
 
           Just j -> do
             jobId <- UUID.toText <$> liftIO UUID.nextRandom
@@ -484,52 +557,55 @@ streamBatch hw batch close producer =
                 $ R.hincrby (batchCounter hw batch) "queued" 1
 
             sink
+
+    run =
+      Conduit.runConduit (Conduit.fuseUpstream producer sink) >>=
+        \case
+          StreamingOk          -> return (pure ())
+          StreamingAborted err -> throw (AbortException err)
   in
   withBatchQueue hw batch
     $ runRedis (hworkerConnection hw)
-    $ R.multiExec (Conduit.connect producer sink)
+    $ R.multiExec run
+
 
 
 withBatchQueue ::
-  Job s t => Hworker s t -> BatchId -> IO (TxResult ()) -> IO Bool
+  Job s t => Hworker s t -> BatchId -> IO (TxResult ()) -> IO QueueingResult
 withBatchQueue hw batch process =
   runRedis (hworkerConnection hw) (batchSummary' hw batch) >>=
     \case
-      Nothing -> do
-        hwlog hw $ "BATCH NOT FOUND: " <> show batch
-        return False
+      Nothing ->
+        return $ BatchNotFound batch
 
       Just summary | batchSummaryStatus summary == BatchQueueing ->
         catch
-          ( process >>=
-              \case
-                TxSuccess () ->
-                  return True
+          ( catch
+              ( process >>=
+                  \case
+                    TxSuccess () ->
+                      return $ QueueingSuccess summary
 
-                TxAborted -> do
-                  hwlog hw ("TRANSACTION ABORTED" :: String)
-                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return False
+                    TxAborted -> do
+                      n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                      return $ TransactionAborted batch n
 
-                TxError err -> do
-                  hwlog hw err
-                  runRedis (hworkerConnection hw) $ resetBatchSummary hw summary
-                  return False
+                    TxError err -> do
+                      n <- runRedis (hworkerConnection hw) $ failBatchSummary hw batch
+                      return $ QueueingFailed batch n (T.pack err)
+              )
+              ( \(AbortException msg :: AbortException) -> do
+                  n <- runRedis (hworkerConnection hw) (failBatchSummary hw batch)
+                  return $ QueueingFailed batch n msg
+              )
           )
           ( \(e :: SomeException) -> do
-              hwlog hw $ show e
-              runRedis (hworkerConnection hw) (resetBatchSummary hw summary)
-              return False
+              n <- runRedis (hworkerConnection hw) (failBatchSummary hw batch)
+              return $ QueueingFailed batch n (T.pack (show e))
           )
 
-      Just _-> do
-        hwlog hw $
-          mconcat
-            [ "QUEUEING COMPLETED FOR BATCH: "
-            , show batch
-            , ". CANNOT ENQUEUE NEW JOBS."
-            ]
-        return False
+      Just summary ->
+        return $ AlreadyQueued summary
 
 
 -- | Prevents queueing new jobs to a batch. If the number of jobs completed equals
@@ -625,7 +701,7 @@ worker hw =
           hwlog hw ("BROKEN JOB" :: Text, t)
           now' <- getCurrentTime
 
-          withNil hw $
+          runWithNil hw $
             R.eval
               "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
               \if del == 1 then\n\
@@ -638,7 +714,7 @@ worker hw =
           delayAndRun
 
         Just (JobRef _ maybeBatch, j) -> do
-          runJob (job (hworkerState hw) j) >>=
+          runJob (job hw j) >>=
             \case
               Success -> do
                 when (hworkerDebug hw) $ hwlog hw ("JOB COMPLETE" :: Text, t)
@@ -657,7 +733,7 @@ worker hw =
                         delayAndRun
 
                   Just batch ->
-                    withMaybe hw
+                    runWithMaybe hw
                       ( R.eval
                           "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                           \if del == 1 then\n\
@@ -687,13 +763,12 @@ worker hw =
                               justRun
                       )
 
-
               Retry msg -> do
                 hwlog hw ("RETRY: " <> msg)
 
                 case maybeBatch of
-                  Nothing -> do
-                    withNil hw $
+                  Nothing ->
+                    runWithNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                         \if del == 1 then\n\
@@ -703,10 +778,8 @@ worker hw =
                         [progressQueue hw, jobQueue hw]
                         [t]
 
-                    delayAndRun
-
-                  Just batch -> do
-                    withNil hw $
+                  Just batch ->
+                    runWithNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                         \if del == 1 then\n\
@@ -717,14 +790,14 @@ worker hw =
                         [progressQueue hw, jobQueue hw, batchCounter hw batch]
                         [t]
 
-                    delayAndRun
+                delayAndRun
 
               Failure msg -> do
                 hwlog hw ("Failure: " <> msg)
 
                 case maybeBatch of
-                  Nothing -> do
-                    withNil hw $
+                  Nothing ->
+                    runWithNil hw $
                       R.eval
                         "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                         \if del == 1 then\n\
@@ -735,10 +808,8 @@ worker hw =
                         [progressQueue hw, failedQueue hw]
                         [t, B8.pack (show (hworkerFailedQueueSize hw - 1))]
 
-                    delayAndRun
-
-                  Just batch -> do
-                    withMaybe hw
+                  Just batch ->
+                    runWithMaybe hw
                       ( R.eval
                           "local del = redis.call('hdel', KEYS[1], ARGV[1])\n\
                           \if del == 1 then\n\
@@ -762,13 +833,15 @@ worker hw =
                           forM_ (decodeBatchSummary batch hm)
                             $ hworkerBatchCompleted hw
                       )
-                    delayAndRun
+
+                delayAndRun
 
 
 -- | Start a monitor. Like 'worker', this is blocking, so should be
 -- started in a thread. This is responsible for retrying jobs that
 -- time out (which can happen if the processing thread is killed, for
--- example). You need to have at least one of these running to have
+-- example) and for pushing scheduled jobs to the queue at the expected time.
+-- You need to have at least one of these running to have
 -- the retry happen, but it is safe to have any number running.
 
 monitor :: Job s t => Hworker s t -> IO ()
@@ -776,9 +849,28 @@ monitor hw =
   forever $ do
     now <- getCurrentTime
 
-    withList hw (R.hkeys (progressQueue hw)) $ \js ->
+    runRedis (hworkerConnection hw) $ do
+      R.zcount (scheduleQueue hw) 0 (utcToDouble now) >>=
+        \case
+          Right n | n > 0 ->
+            withNil hw $
+              R.eval
+                "local jobs = redis.call('zrangebyscore', KEYS[1], '0', ARGV[1])\n\
+                \redis.call('lpush', KEYS[2], unpack(jobs))\n\
+                \redis.call('zremrangebyscore', KEYS[1], '0', ARGV[1])\n\
+                \return nil"
+                [scheduleQueue hw, jobQueue hw]
+                [B8.pack (show (utcToDouble now))]
+
+          Right _ ->
+            return ()
+
+          Left err ->
+            liftIO $ hwlog hw err
+
+    runWithList hw (R.hkeys (progressQueue hw)) $ \js ->
       forM_ js $ \j ->
-        withMaybe hw (R.hget (progressQueue hw) j) $
+        runWithMaybe hw (R.hget (progressQueue hw) j) $
           \start ->
             let
               duration =
@@ -787,7 +879,7 @@ monitor hw =
             in
             when (duration > hworkerJobTimeout hw) $ do
               n <-
-                withInt hw $
+                runWithInt hw $
                   R.eval
                     "local del = redis.call('hdel', KEYS[2], ARGV[1])\n\
                     \if del == 1 then\
@@ -859,9 +951,9 @@ failed hw =
 debugger :: Job s t => Int -> Hworker s t -> IO ()
 debugger microseconds hw =
   forever $ do
-    withList hw (R.hkeys (progressQueue hw)) $
+    runWithList hw (R.hkeys (progressQueue hw)) $
       \running ->
-        withList hw (R.lrange (jobQueue hw) 0 (-1))
+        runWithList hw (R.lrange (jobQueue hw) 0 (-1))
           $ \queued -> hwlog hw ("DEBUG" :: Text, queued, running)
 
     threadDelay microseconds
@@ -913,9 +1005,9 @@ batchSummary' hw batch = do
 
 -- Redis helpers follow
 
-withList ::
+runWithList ::
   Show a => Hworker s t -> Redis (Either a [b]) -> ([b] -> IO ()) -> IO ()
-withList hw a f =
+runWithList hw a f =
   runRedis (hworkerConnection hw) a >>=
     \case
       Left err -> hwlog hw err
@@ -923,9 +1015,9 @@ withList hw a f =
       Right xs -> f xs
 
 
-withMaybe ::
+runWithMaybe ::
   Show a => Hworker s t -> Redis (Either a (Maybe b)) -> (b -> IO ()) -> IO ()
-withMaybe hw a f = do
+runWithMaybe hw a f = do
   runRedis (hworkerConnection hw) a >>=
     \case
       Left err       -> hwlog hw err
@@ -933,16 +1025,22 @@ withMaybe hw a f = do
       Right (Just v) -> f v
 
 
-withNil :: Show a => Hworker s t -> Redis (Either a (Maybe ByteString)) -> IO ()
+runWithNil :: Show a => Hworker s t -> Redis (Either a (Maybe ByteString)) -> IO ()
+runWithNil hw a =
+  runRedis (hworkerConnection hw) $ withNil hw a
+
+
+withNil ::
+  Show a => Hworker s t -> Redis (Either a (Maybe ByteString)) -> Redis ()
 withNil hw a =
-  runRedis (hworkerConnection hw) a >>=
+  a >>=
     \case
-      Left err -> hwlog hw err
+      Left err -> liftIO $ hwlog hw err
       Right _  -> return ()
 
 
-withInt :: Hworker s t -> Redis (Either R.Reply Integer) -> IO Integer
-withInt hw a =
+runWithInt :: Hworker s t -> Redis (Either R.Reply Integer) -> IO Integer
+runWithInt hw a =
   runRedis (hworkerConnection hw) a >>=
     \case
       Left err -> hwlog hw err >> return (-1)
@@ -953,12 +1051,14 @@ withInt hw a =
 
 encodeBatchStatus :: BatchStatus -> ByteString
 encodeBatchStatus BatchQueueing   = "queueing"
+encodeBatchStatus BatchFailed     = "failed"
 encodeBatchStatus BatchProcessing = "processing"
 encodeBatchStatus BatchFinished   = "finished"
 
 
 decodeBatchStatus :: ByteString -> Maybe BatchStatus
 decodeBatchStatus "queueing"   = Just BatchQueueing
+decodeBatchStatus "failed"     = Just BatchFailed
 decodeBatchStatus "processing" = Just BatchProcessing
 decodeBatchStatus "finished"   = Just BatchFinished
 decodeBatchStatus _            = Nothing
@@ -987,18 +1087,17 @@ readMaybe =
   fmap fst . listToMaybe . reads . B8.unpack
 
 
-resetBatchSummary :: R.RedisCtx m n => Hworker s t -> BatchSummary -> m ()
-resetBatchSummary hw BatchSummary{..} =
-  let
-    encode =
-      B8.pack . show
-  in
-  void $
-    R.hmset (batchCounter hw batchSummaryID)
-      [ ("queued", encode batchSummaryQueued)
-      , ("completed", encode batchSummaryCompleted)
-      , ("successes", encode batchSummarySuccesses)
-      , ("failures", encode batchSummaryFailures)
-      , ("retries", encode batchSummaryRetries)
-      , ("status", encodeBatchStatus batchSummaryStatus)
-      ]
+failBatchSummary :: Hworker s t -> BatchId -> Redis Int
+failBatchSummary hw batch = do
+  void
+    $ R.hset (batchCounter hw batch) "status"
+    $ encodeBatchStatus BatchFailed
+
+  batchSummary' hw batch >>=
+    \case
+      Just summary -> return $ batchSummaryQueued summary
+      _            -> return 0
+
+
+utcToDouble :: UTCTime -> Double
+utcToDouble = realToFrac . Posix.utcTimeToPOSIXSeconds

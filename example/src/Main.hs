@@ -29,7 +29,10 @@ instance FromJSON PrintJob
 
 
 instance Job State PrintJob where
-  job (State mvar) PrintA = do
+  job hw PrintA =
+    let
+      State mvar = hworkerState hw
+    in do
     v <- takeMVar mvar
     if v == 0
       then do

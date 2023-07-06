@@ -15,6 +15,7 @@ import           Data.Aeson               ( FromJSON(..), ToJSON(..) )
 import qualified Data.Conduit            as Conduit
 import           Data.Text                ( Text )
 import qualified Data.Text               as T
+import           Data.Time
 import qualified Database.Redis          as Redis
 import           GHC.Generics             ( Generic)
 import           Test.Hspec
@@ -200,10 +201,12 @@ main = hspec $ do
       queueBatch hworker batch False [SimpleJob]
       threadDelay 30000
       stopBatchQueueing hworker batch
-      queueBatch hworker batch False [SimpleJob] >>= shouldBe False
-      threadDelay 30000
       summary <- expectBatchSummary hworker batch
-      batchSummaryQueued summary `shouldBe` 1
+      queueBatch hworker batch False [SimpleJob]
+        >>= shouldBe (AlreadyQueued summary)
+      threadDelay 30000
+      summary' <- expectBatchSummary hworker batch
+      batchSummaryQueued summary' `shouldBe` 1
       killThread wthread
       destroy hworker
 
@@ -264,7 +267,7 @@ main = hspec $ do
       killThread wthread
       destroy hworker
 
-    it "should change job status finished when last processed" $ do
+    it "should change job status to finished when last processed" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
@@ -302,9 +305,9 @@ main = hspec $ do
         mvar <- newMVar 0
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
-        streamBatch hworker batch True
-          $ replicateM_ 50
-          $ Conduit.yield SimpleJob
+        streamBatch hworker batch True $ do
+          replicateM_ 50 $ Conduit.yield SimpleJob
+          return StreamingOk
         ls <- jobs hworker
         length ls `shouldBe` 50
         summary <- expectBatchSummary hworker batch
@@ -318,9 +321,9 @@ main = hspec $ do
         batch <- startBatch hworker Nothing
         streamBatch hworker batch True $ do
           replicateM_ 20 $ Conduit.yield SimpleJob
-          error "BLOW UP!"
-          replicateM_ 20 $ Conduit.yield SimpleJob
+          return (StreamingAborted "abort")
         ls <- jobs hworker
+        expectBatchSummary hworker batch
         destroy hworker
         length ls `shouldBe` 0
 
@@ -328,10 +331,11 @@ main = hspec $ do
         mvar <- newMVar 0
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
-        streamBatch hworker batch True $ do
+        streamBatchTx hworker batch True $ do
           replicateM_ 20 $ Conduit.yield SimpleJob
           _ <- lift $ Redis.lpush "" []
           replicateM_ 20 $ Conduit.yield SimpleJob
+          return StreamingOk
         ls <- jobs hworker
         destroy hworker
         length ls `shouldBe` 0
@@ -341,12 +345,14 @@ main = hspec $ do
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
         _ <- Redis.runRedis (hworkerConnection hworker) $ Redis.watch [batchCounter hworker batch]
-        streamBatch hworker batch True $ replicateM_ 20 $ Conduit.yield SimpleJob
+        streamBatch hworker batch True $ do
+          replicateM_ 20 $ Conduit.yield SimpleJob
+          return StreamingOk
         ls <- jobs hworker
         destroy hworker
         length ls `shouldBe` 0
 
-      it "should increment summary but then reset after failure" $ do
+      it "should increment summary up until failure" $ do
         mvar <- newMVar 0
         hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
         batch <- startBatch hworker Nothing
@@ -358,6 +364,7 @@ main = hspec $ do
             error "BLOW UP!"
             replicateM_ 5 $
               Conduit.yield SimpleJob >> liftIO (threadDelay 50000)
+            return StreamingOk
 
         threadDelay 190000
         summary1 <- expectBatchSummary hworker batch
@@ -366,7 +373,8 @@ main = hspec $ do
         length ls `shouldBe` 0
         threadDelay 100000
         summary2 <- expectBatchSummary hworker batch
-        batchSummaryQueued summary2 `shouldBe` 0
+        batchSummaryQueued summary2 `shouldBe` 5
+        batchSummaryStatus summary2 `shouldBe` BatchFailed
         killThread thread
         destroy hworker
 
@@ -462,6 +470,39 @@ main = hspec $ do
       -- precision without adding other delay mechanisms, or
       -- something to make it more deterministic.
 
+  describe "Scheduled and Recurring Jobs" $ do
+    it "should execute job at scheduled time" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
+      wthread <- forkIO (worker hworker)
+      mthread <- forkIO (monitor hworker)
+      time <- getCurrentTime
+      queueScheduled hworker SimpleJob (addUTCTime 1 time)
+      queueScheduled hworker SimpleJob (addUTCTime 2 time)
+      queueScheduled hworker SimpleJob (addUTCTime 4 time)
+      threadDelay 1500000 >> readMVar mvar >>= shouldBe 1
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 1000000 >> readMVar mvar >>= shouldBe 3
+      killThread wthread
+      killThread mthread
+      destroy hworker
+
+    it "should execute a recurring job" $ do
+      mvar <- newMVar 0
+      hworker <- createWith (conf "recurringworker-1" (RecurringState mvar))
+      wthread <- forkIO (worker hworker)
+      mthread <- forkIO (monitor hworker)
+      time <- getCurrentTime
+      queueScheduled hworker RecurringJob (addUTCTime 2 time)
+      threadDelay 3000000 >> readMVar mvar >>= shouldBe 1
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 2
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 3
+      threadDelay 2000000 >> readMVar mvar >>= shouldBe 4
+      destroy hworker
+      killThread wthread
+      killThread mthread
+
   describe "Broken jobs" $
     it "should store broken jobs" $ do
       -- NOTE(dbp 2015-08-09): The more common way this could
@@ -530,7 +571,7 @@ newtype SimpleState =
   SimpleState (MVar Int)
 
 instance Job SimpleState SimpleJob where
-  job (SimpleState mvar) SimpleJob =
+  job Hworker { hworkerState = SimpleState mvar } SimpleJob =
     modifyMVarMasked_ mvar (return . (+1)) >> return Success
 
 
@@ -544,7 +585,7 @@ newtype ExState =
   ExState (MVar Int)
 
 instance Job ExState ExJob where
-  job (ExState mvar) ExJob = do
+  job Hworker { hworkerState = ExState mvar } ExJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -562,7 +603,7 @@ newtype RetryState =
   RetryState (MVar Int)
 
 instance Job RetryState RetryJob where
-  job (RetryState mvar) RetryJob = do
+  job Hworker { hworkerState = RetryState mvar } RetryJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -580,7 +621,7 @@ newtype FailState =
   FailState (MVar Int)
 
 instance Job FailState FailJob where
-  job (FailState mvar) FailJob = do
+  job Hworker { hworkerState = FailState mvar } FailJob = do
     modifyMVarMasked_ mvar (return . (+1))
     v <- readMVar mvar
     if v > 1
@@ -598,7 +639,7 @@ newtype AlwaysFailState =
   AlwaysFailState (MVar Int)
 
 instance Job AlwaysFailState AlwaysFailJob where
-  job (AlwaysFailState mvar) AlwaysFailJob = do
+  job Hworker { hworkerState = AlwaysFailState mvar} AlwaysFailJob = do
     modifyMVarMasked_ mvar (return . (+1))
     return (Failure "AlwaysFailJob fails")
 
@@ -613,7 +654,7 @@ newtype TimedState =
   TimedState (MVar Int)
 
 instance Job TimedState TimedJob where
-  job (TimedState mvar) (TimedJob delay) = do
+  job Hworker { hworkerState = TimedState mvar } (TimedJob delay) = do
     threadDelay delay
     modifyMVarMasked_ mvar (return . (+1))
     return Success
@@ -629,8 +670,25 @@ newtype BigState =
   BigState (MVar Int)
 
 instance Job BigState BigJob where
-  job (BigState mvar) (BigJob _) =
+  job Hworker { hworkerState = BigState mvar } (BigJob _) =
     modifyMVarMasked_ mvar (return . (+1)) >> return Success
+
+
+data RecurringJob =
+  RecurringJob deriving (Generic, Show, Eq)
+
+instance ToJSON RecurringJob
+instance FromJSON RecurringJob
+
+newtype RecurringState =
+  RecurringState (MVar Int)
+
+instance Job RecurringState RecurringJob where
+  job hw@Hworker{ hworkerState = RecurringState mvar} RecurringJob = do
+    modifyMVarMasked_ mvar (return . (+1))
+    time <- getCurrentTime
+    queueScheduled hw RecurringJob (addUTCTime 1.99 time)
+    return Success
 
 
 conf :: Text -> s -> HworkerConfig s
