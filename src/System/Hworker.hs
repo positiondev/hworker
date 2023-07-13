@@ -64,6 +64,7 @@ module System.Hworker
   , createWith
   , destroy
   , worker
+  , scheduler
   , monitor
     -- * Queuing Jobs
   , queue
@@ -837,15 +838,12 @@ worker hw =
                 delayAndRun
 
 
--- | Start a monitor. Like 'worker', this is blocking, so should be
--- started in a thread. This is responsible for retrying jobs that
--- time out (which can happen if the processing thread is killed, for
--- example) and for pushing scheduled jobs to the queue at the expected time.
--- You need to have at least one of these running to have
--- the retry happen, but it is safe to have any number running.
+-- | Start a scheduler. Like 'worker', this is blocking, so should be
+-- started in a thread. This is responsible for pushing scheduled jobs
+-- to the queue at the expected time.
 
-monitor :: Job s t => Hworker s t -> IO ()
-monitor hw =
+scheduler :: Job s t => Hworker s t -> IO ()
+scheduler hw  =
   forever $ do
     now <- getCurrentTime
 
@@ -867,6 +865,20 @@ monitor hw =
 
           Left err ->
             liftIO $ hwlog hw err
+
+    threadDelay 500000 >> scheduler hw
+
+
+-- | Start a monitor. Like 'worker', this is blocking, so should be
+-- started in a thread. This is responsible for retrying jobs that
+-- time out (which can happen if the processing thread is killed, for
+-- example). You need to have at least one of these running to have
+-- the retry happen, but it is safe to have any number running.
+
+monitor :: Job s t => Hworker s t -> IO ()
+monitor hw =
+  forever $ do
+    now <- getCurrentTime
 
     runWithList hw (R.hkeys (progressQueue hw)) $ \js ->
       forM_ js $ \j ->

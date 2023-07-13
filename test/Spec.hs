@@ -475,7 +475,7 @@ main = hspec $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "simpleworker-1" (SimpleState mvar))
       wthread <- forkIO (worker hworker)
-      mthread <- forkIO (monitor hworker)
+      sthread <- forkIO (scheduler hworker)
       time <- getCurrentTime
       queueScheduled hworker SimpleJob (addUTCTime 1 time)
       queueScheduled hworker SimpleJob (addUTCTime 2 time)
@@ -485,14 +485,14 @@ main = hspec $ do
       threadDelay 1000000 >> readMVar mvar >>= shouldBe 2
       threadDelay 1000000 >> readMVar mvar >>= shouldBe 3
       killThread wthread
-      killThread mthread
+      killThread sthread
       destroy hworker
 
     it "should execute a recurring job" $ do
       mvar <- newMVar 0
       hworker <- createWith (conf "recurringworker-1" (RecurringState mvar))
       wthread <- forkIO (worker hworker)
-      mthread <- forkIO (monitor hworker)
+      sthread <- forkIO (scheduler hworker)
       time <- getCurrentTime
       queueScheduled hworker RecurringJob (addUTCTime 2 time)
       threadDelay 3000000 >> readMVar mvar >>= shouldBe 1
@@ -501,7 +501,7 @@ main = hspec $ do
       threadDelay 2000000 >> readMVar mvar >>= shouldBe 4
       destroy hworker
       killThread wthread
-      killThread mthread
+      killThread sthread
 
   describe "Broken jobs" $
     it "should store broken jobs" $ do
