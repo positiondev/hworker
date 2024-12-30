@@ -23,4 +23,5 @@ executable hworker-example
                      , attoparsec
                      , uuid >= 1.2.6
                      , hworker
+                     , saturn
   default-language:    Haskell2010
