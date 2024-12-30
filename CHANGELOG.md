@@ -1,3 +1,7 @@
+* 0.4.0 Libby Horacek 2024-12-30
+
+  Bump version due to breaking changes
+
 * 0.3.0 Remeike Forbes 2022-11-23
 
   Introduce batched jobs
